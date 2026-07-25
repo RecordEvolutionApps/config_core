@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ironflock-config-core"
+version = "1.0.0"
+description = "Agent-facing asset configuration tools (WAMP RPCs) for IronFlock collector apps"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Record Evolution GmbH" }]
+# Zero runtime dependencies. The ironflock SDK is NOT a dependency: the
+# session handle is injected by the consuming app (register_asset_tools),
+# which must pin ironflock >= 1.6.0 (proper error propagation on every call).
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[tool.setuptools]
+packages = ["config_core"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
