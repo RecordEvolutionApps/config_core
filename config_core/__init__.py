@@ -7,7 +7,7 @@ soft delete with cascade, verification, never-raise agent responses). See
 README.md for the full contract.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 from .handlers import (
     ASSET_NAME_PATTERN,
