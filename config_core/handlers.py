@@ -27,9 +27,10 @@ from .store import (
     strip_platform,
 )
 
-# The board's asset-name rule; apps may override via register_asset_tools.
+# The canonical board asset-name rule; apps whose board form validates a
+# different pattern override it via register_asset_tools(name_pattern=...).
+# Rejection messages quote the active pattern, so overrides stay truthful.
 ASSET_NAME_PATTERN = r"^[a-zA-Z0-9 ]{3,50}$"
-NAME_RULE_TEXT = "3-50 characters, letters, digits and spaces only"
 
 # collector_core contract columns present in every collector app. The library
 # owns their hygiene and create defaults; everything else in a row belongs to
@@ -272,7 +273,8 @@ def _check_name(asset_name, cfg):
     stripped = asset_name.strip()
     if not cfg.name_pattern.fullmatch(stripped):
         return stripped, [
-            f"asset_name {stripped!r} is invalid: {NAME_RULE_TEXT}"
+            f"asset_name {stripped!r} is invalid: it must match "
+            f"{cfg.name_pattern.pattern}"
         ]
     return stripped, []
 
@@ -500,7 +502,7 @@ async def _mutation_prelude(store, cfg, asset_name):
     if problems:
         return name, [], _rejected(
             "invalid_name", problems,
-            f"Asset names must be {NAME_RULE_TEXT}.",
+            f"Asset names must match {cfg.name_pattern.pattern}.",
         )
     rows, err = await store.read_assets()
     if err is not None:
@@ -565,7 +567,8 @@ async def get_asset(store, cfg, asset_name):
     name, problems = _check_name(asset_name, cfg)
     if problems:
         return _rejected(
-            "invalid_name", problems, f"Asset names must be {NAME_RULE_TEXT}."
+            "invalid_name", problems,
+            f"Asset names must match {cfg.name_pattern.pattern}.",
         )
     rows, err = await store.read_assets()
     if err is not None:
