@@ -90,6 +90,13 @@ def test_coerce_rpc_args_conventions():
     assert coerce_rpc_args((), {}, ("a",)) == {}
 
 
+def test_coerce_rpc_args_drops_device_key():
+    # The platform strips the routing device_key before dispatch; if one ever
+    # leaks through, op(**params) would TypeError and reject a valid call.
+    assert coerce_rpc_args((), {"device_key": 42, "a": 1}, ("a",)) == {"a": 1}
+    assert coerce_rpc_args(({"device_key": 42, "a": 1},), {}, ("a",)) == {"a": 1}
+
+
 async def test_handlers_accept_all_calling_conventions():
     fake, _, _, handlers = make_tools()
     seed_asset(fake, "Press 1")
@@ -922,6 +929,10 @@ async def test_registered_handler_end_to_end():
 
 def test_guidance_constants_exported():
     assert "dry_run" in RECOMMENDED_PROMPT_GUIDANCE
+    # The asset tools are topic tools: without this the agent guesses a
+    # device_key instead of resolving one, and configures the wrong gateway.
+    assert "device_key" in RECOMMENDED_PROMPT_GUIDANCE
+    assert "list_devices" in RECOMMENDED_PROMPT_GUIDANCE
     assert "error-logs" in SQL_DIAGNOSTICS_GUIDANCE
     assert ASSET_NAME_PATTERN == r"^[a-zA-Z0-9 ]{3,50}$"
 

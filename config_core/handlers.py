@@ -75,7 +75,10 @@ FALSE_STRINGS = ("false", "no", "0")
 
 RECOMMENDED_PROMPT_GUIDANCE = (
     "You can list, inspect, create, update and delete assets yourself with "
-    "the asset tools. Before any create/update/delete: run it with dry_run "
+    "the asset tools. Every one of them runs ON a gateway and needs its "
+    "device_key: take it from list_devices, ask the user which gateway if "
+    "several run this app, and keep the same one all session - assets are "
+    "per gateway. Before any create/update/delete: run it with dry_run "
     "true, show the user exactly what will change and apply only after they "
     "agree. After applying, verify with get_asset a few seconds later - "
     "status online means data flows. Renaming means create new + delete old."
@@ -131,12 +134,20 @@ def coerce_rpc_args(args, kwargs, positional=()):
     """Normalize WAMP call args into one dict: keyword args, a single
     positional dict, or bare positional values mapped onto ``positional`` --
     the platform agent runtime's calling convention is not pinned down, so
-    tolerate all of them."""
+    tolerate all of them.
+
+    ``device_key`` is dropped: the agent must send it to address the call at a
+    gateway, the platform strips it before dispatch, and this process already
+    knows its own key. Tolerating a leaked one keeps every tool from failing
+    as "unexpected parameters"."""
     if kwargs:
-        return dict(kwargs)
-    if len(args) == 1 and isinstance(args[0], dict):
-        return dict(args[0])
-    return {name: value for name, value in zip(positional, args)}
+        params = dict(kwargs)
+    elif len(args) == 1 and isinstance(args[0], dict):
+        params = dict(args[0])
+    else:
+        params = {name: value for name, value in zip(positional, args)}
+    params.pop("device_key", None)
+    return params
 
 
 def _parse_object_param(value, param_name):

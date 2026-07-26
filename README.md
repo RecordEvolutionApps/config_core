@@ -191,10 +191,17 @@ Paste into your configuring agent's `tools`, edit only the two spots marked
 guidance texts to its system prompt and give it a few extra
 `max_iterations` for the list → dry_run → apply → verify loop.
 
+Every block declares `device_key`. The platform adds that parameter to any
+tool with a `topic` and strips it before your handler runs — it addresses
+the call to one gateway, and the agent resolves it with the built-in
+`list_devices` tool. Declaring it is what gives it a useful description,
+and it is what keeps it legal under the `additionalProperties: false` these
+blocks set. Keep it in `required`.
+
 ```yaml
     list_assets:
       description: >-
-        Lists every configured asset on this gateway with its fields,
+        Lists every configured asset on the given gateway with its fields,
         enabled/paused state, demo mode, collect interval and live status
         (online/offline/paused plus last error detail). Call it first to
         see what exists before creating, updating, deleting or
@@ -203,9 +210,15 @@ guidance texts to its system prompt and give it a few extra
       parameters:
         type: object
         properties:
+          device_key:
+            type: integer
+            description: >-
+              Gateway to act on, from list_devices. Assets live per
+              gateway - use the same one all session.
           include_deleted:
             type: boolean
             description: Also list soft-deleted assets. Default false.
+        required: [device_key]
         additionalProperties: false
 
     get_asset:
@@ -221,15 +234,20 @@ guidance texts to its system prompt and give it a few extra
       parameters:
         type: object
         properties:
+          device_key:
+            type: integer
+            description: >-
+              Gateway to act on, from list_devices. Assets live per
+              gateway - use the same one all session.
           asset_name:
             type: string
             description: Asset name from list_assets.
-        required: [asset_name]
+        required: [device_key, asset_name]
         additionalProperties: false
 
     create_asset:
       description: >-
-        Creates a new asset on this gateway and starts collecting
+        Creates a new asset on the given gateway and starts collecting
         immediately. asset_name must be unique, 3-50 chars, letters, digits
         and spaces only. Pass the connection fields in fields (see the
         field reference in your instructions). Always call with dry_run
@@ -239,6 +257,11 @@ guidance texts to its system prompt and give it a few extra
       parameters:
         type: object
         properties:
+          device_key:
+            type: integer
+            description: >-
+              Gateway to act on, from list_devices. Assets live per
+              gateway - use the same one all session.
           asset_name:
             type: string
             description: Unique name, 3-50 chars, letters/digits/spaces.
@@ -252,7 +275,7 @@ guidance texts to its system prompt and give it a few extra
           dry_run:
             type: boolean
             description: Validate and preview without writing.
-        required: [asset_name, fields]
+        required: [device_key, asset_name, fields]
         additionalProperties: false
 
     update_asset:
@@ -268,6 +291,11 @@ guidance texts to its system prompt and give it a few extra
       parameters:
         type: object
         properties:
+          device_key:
+            type: integer
+            description: >-
+              Gateway to act on, from list_devices. Assets live per
+              gateway - use the same one all session.
           asset_name:
             type: string
             description: Asset to update (from list_assets).
@@ -282,7 +310,7 @@ guidance texts to its system prompt and give it a few extra
           dry_run:
             type: boolean
             description: Validate and preview without writing.
-        required: [asset_name, changes]
+        required: [device_key, asset_name, changes]
         additionalProperties: false
 
     delete_asset:
@@ -297,13 +325,18 @@ guidance texts to its system prompt and give it a few extra
       parameters:
         type: object
         properties:
+          device_key:
+            type: integer
+            description: >-
+              Gateway to act on, from list_devices. Assets live per
+              gateway - use the same one all session.
           asset_name:
             type: string
             description: Asset to delete (from list_assets).
           expected_tsp:
             type: string
             description: _meta.tsp from get_asset; rejects if changed since.
-        required: [asset_name]
+        required: [device_key, asset_name]
         additionalProperties: false
 
     list_datapoints:
@@ -317,10 +350,15 @@ guidance texts to its system prompt and give it a few extra
       parameters:
         type: object
         properties:
+          device_key:
+            type: integer
+            description: >-
+              Gateway to act on, from list_devices. Assets live per
+              gateway - use the same one all session.
           asset_name:
             type: string
             description: Asset whose datapoints to list.
-        required: [asset_name]
+        required: [device_key, asset_name]
         additionalProperties: false
 
     set_datapoints:
@@ -335,6 +373,11 @@ guidance texts to its system prompt and give it a few extra
       parameters:
         type: object
         properties:
+          device_key:
+            type: integer
+            description: >-
+              Gateway to act on, from list_devices. Assets live per
+              gateway - use the same one all session.
           asset_name:
             type: string
             description: Asset whose datapoints to change.
@@ -353,7 +396,7 @@ guidance texts to its system prompt and give it a few extra
                   type: boolean
               required: [datapoint_id]
               additionalProperties: false
-        required: [asset_name, changes]
+        required: [device_key, asset_name, changes]
         additionalProperties: false
 ```
 
@@ -362,10 +405,13 @@ guidance texts to its system prompt and give it a few extra
 `config_core.RECOMMENDED_PROMPT_GUIDANCE` — the write discipline:
 
 > You can list, inspect, create, update and delete assets yourself with the
-> asset tools. Before any create/update/delete: run it with dry_run true,
-> show the user exactly what will change and apply only after they agree.
-> After applying, verify with get_asset a few seconds later - status online
-> means data flows. Renaming means create new + delete old.
+> asset tools. Every one of them runs ON a gateway and needs its device_key:
+> take it from list_devices, ask the user which gateway if several run this
+> app, and keep the same one all session - assets are per gateway. Before
+> any create/update/delete: run it with dry_run true, show the user exactly
+> what will change and apply only after they agree. After applying, verify
+> with get_asset a few seconds later - status online means data flows.
+> Renaming means create new + delete old.
 
 `config_core.SQL_DIAGNOSTICS_GUIDANCE` — for agents with `data_access`
 enabled: the table schema (`error-logs` with the `msg LIKE 'AssetName: %'`
@@ -382,7 +428,8 @@ your validate function in the app's pytest suite and drive the registered
 handlers against a fake SDK handle (see `tests/_fakes.py` for the model:
 latest-per-identity reads, raising failures, report_error recording). Keep
 a drift test asserting your ai-template's config-tool topics are a subset
-of `config_core.DEFAULT_TOPICS` values and that your board's asset-name
+of `config_core.DEFAULT_TOPICS` values, that every tool with a `topic`
+declares a required integer `device_key`, and that your board's asset-name
 validation equals `config_core.ASSET_NAME_PATTERN`.
 
 ## Versioning and releases
