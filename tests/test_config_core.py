@@ -680,6 +680,46 @@ async def test_set_datapoints_batch_and_crash_class_invariants():
     assert changed["name"] == "temp"  # echo-merge preserved machine columns
 
 
+async def test_set_datapoints_demo_settings():
+    fake, _, _, handlers = make_tools()
+    seed_asset(fake, "Press 1")
+    seed_datapoint(fake, "Press 1", "temp")
+    seed_datapoint(fake, "Press 1", "running")
+    response = check(await handlers["set_datapoints"](
+        asset_name="Press 1",
+        changes=[
+            {"datapoint_id": "temp", "demo_value": "75", "demo_variance": 2},
+            {"datapoint_id": "running", "demo_value": True},  # a resting state
+        ],
+    ))
+    assert response["applied"] == 2
+    temp = fake.latest("datapoints", datapoint_id="temp")
+    assert temp["demo_value"] == 75.0 and temp["demo_variance"] == 2.0
+    assert fake.latest("datapoints", datapoint_id="running")["demo_value"] is True
+
+
+async def test_set_datapoints_demo_settings_rejected_and_cleared():
+    fake, _, _, handlers = make_tools()
+    seed_asset(fake, "Press 1")
+    seed_datapoint(fake, "Press 1", "temp", demo_value=75.0)
+    response = check(await handlers["set_datapoints"](
+        asset_name="Press 1",
+        changes=[
+            {"datapoint_id": "temp", "demo_variance": "wide"},
+            {"datapoint_id": "temp", "demo_value": "warm"},
+        ],
+    ))
+    assert response["rejected"] == 2
+    assert "not a number" in " ".join(response["results"][0]["problems"])
+    # an explicit null restores the default range
+    response = check(await handlers["set_datapoints"](
+        asset_name="Press 1",
+        changes={"datapoint_id": "temp", "demo_value": None},
+    ))
+    assert response["applied"] == 1
+    assert fake.latest("datapoints", datapoint_id="temp")["demo_value"] is None
+
+
 async def test_set_datapoints_cap_and_dry_run():
     fake, _, _, handlers = make_tools()
     seed_asset(fake, "Press 1")

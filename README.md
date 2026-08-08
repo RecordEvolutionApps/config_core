@@ -103,7 +103,7 @@ tombstone an asset.
 | `update`         | `app_assets.update`    | partial update via echo-merge |
 | `delete`         | `app_assets.delete`    | soft delete, cascades to datapoint rows |
 | `list_datapoints`| `app_datapoints.list`  | the live datapoint catalog of one asset |
-| `set_datapoints` | `app_datapoints.set`   | toggle `enabled` / `change_detection` per datapoint |
+| `set_datapoints` | `app_datapoints.set`   | per-datapoint `enabled` / `change_detection` switches + `demo_value` / `demo_variance` |
 
 All apps share these topic names — the platform scopes the URIs per device.
 
@@ -164,10 +164,13 @@ steering text for the agent and are NOT part of the semver contract.
   a write reconfigures the asset immediately, and the adapter's
   `prepare_datapoints` regenerates the datapoints catalog from the asset
   config. No restart, no extra plumbing, **no app-side extraction function**.
-- **Datapoints.** Only `enabled` and `change_detection` are user-owned
-  (preserved across rediscovery); everything else is machine-written and
-  `set_datapoints` rejects it. Datapoint switches apply on the next publish
-  cycle WITHOUT restarting the connection.
+- **Datapoints.** Only `enabled`, `change_detection`, `demo_value` and
+  `demo_variance` are user-owned (preserved across rediscovery); everything
+  else is machine-written and `set_datapoints` rejects it. All four apply on
+  the next publish cycle WITHOUT restarting the connection. The demo pair
+  shapes what demo mode emits for the datapoint — `demo_value` is the value it
+  sits at in engineering units (a boolean instead gives a resting state),
+  `demo_variance` how far it may wander; null on either restores the default.
 - **Delete** is a soft delete (measurement history is retained, the name
   becomes reusable) and cascades tombstones to the asset's datapoint rows.
   It is convergent: calling it again finishes a partial cascade.
@@ -363,12 +366,14 @@ blocks set. Keep it in `required`.
 
     set_datapoints:
       description: >-
-        Toggles per-datapoint switches on one asset: enabled (false stops
-        collecting that datapoint) and change_detection (true stores only
-        value changes). Applies on the next cycle WITHOUT restarting the
-        asset's connection. Everything else about a datapoint (address,
-        type, scale) is defined by the asset's configuration - change that
-        instead.
+        Sets the user-owned fields of one asset's datapoints: enabled (false
+        stops collecting that datapoint), change_detection (true stores only
+        value changes), and for demo mode demo_value (the value it should
+        sit at, in engineering units - or a boolean for a resting state) and
+        demo_variance (how far it may wander). Applies on the next cycle
+        WITHOUT restarting the asset's connection. Everything else about a
+        datapoint (address, type, scale) is defined by the asset's
+        configuration - change that instead.
       topic: app_datapoints.set
       parameters:
         type: object
@@ -394,6 +399,17 @@ blocks set. Keep it in `required`.
                   type: boolean
                 change_detection:
                   type: boolean
+                demo_value:
+                  description: >-
+                    Demo mode: the value this datapoint should sit at, in
+                    engineering units, or a boolean for a resting state.
+                    null restores the default range.
+                demo_variance:
+                  type: number
+                  description: >-
+                    Demo mode: how far the reading may wander from
+                    demo_value (same units); for a boolean demo_value, the
+                    per-sample chance (0-1) of blipping out of that state.
               required: [datapoint_id]
               additionalProperties: false
         required: [device_key, asset_name, changes]

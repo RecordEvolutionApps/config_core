@@ -45,8 +45,10 @@ BOOL_COLUMNS = ("enabled", "demo_mode")
 
 # The only datapoint columns a user/agent owns; everything else is written by
 # discovery/spec parsing and would be overwritten (collector_core
-# USER_DATAPOINT_COLUMNS).
-USER_DATAPOINT_COLUMNS = ("enabled", "change_detection")
+# USER_DATAPOINT_COLUMNS -- kept identical, order included, by a drift test in
+# each consuming app). The two switches gate what is collected and stored; the
+# two demo settings shape what demo mode produces for the datapoint.
+USER_DATAPOINT_COLUMNS = ("enabled", "change_detection", "demo_value", "demo_variance")
 
 # Secrets never go into tables (platform contract). Column-name denylist plus
 # cheap value heuristics; no entropy scoring (false-positive prone).
@@ -355,6 +357,51 @@ def _coerce_bool(value):
         if lowered in FALSE_STRINGS:
             return False, None
     return None, f"{value!r} is not a boolean"
+
+
+def _coerce_number(value):
+    """(number_or_None, problem_or_None). An explicit null clears the setting.
+
+    Booleans are rejected rather than read as 0/1: the caller that means a
+    state says so on ``demo_value``, and silently turning True into 1.0 there
+    would swap a resting state for a constant reading."""
+    if value is None:
+        return None, None
+    if isinstance(value, bool):
+        return None, f"{value!r} is not a number"
+    if isinstance(value, (int, float)):
+        return float(value), None
+    if isinstance(value, str):
+        try:
+            return float(value.strip()), None
+        except ValueError:
+            pass
+    return None, f"{value!r} is not a number"
+
+
+def _coerce_demo_value(value):
+    """(setting_or_None, problem_or_None) -- a number, or a boolean for a
+    datapoint that rests in a state. Numbers win where both parse (``1`` is a
+    reading of one, not "on"); an explicit null restores the default range."""
+    if value is None or isinstance(value, bool):
+        return value, None
+    number, problem = _coerce_number(value)
+    if problem is None:
+        return number, None
+    boolean, _ = _coerce_bool(value)
+    if boolean is not None:
+        return boolean, None
+    return None, f"{value!r} is not a number or a boolean"
+
+
+# Per-column coercion for the user-owned datapoint columns: the switches are
+# strict booleans, the demo settings numbers (demo_value also takes a boolean).
+DATAPOINT_COERCERS = {
+    "enabled": _coerce_bool,
+    "change_detection": _coerce_bool,
+    "demo_value": _coerce_demo_value,
+    "demo_variance": _coerce_number,
+}
 
 
 def _coerce_core(fields):
@@ -1243,7 +1290,7 @@ async def _set_one_datapoint(store, cfg, live_dps, item, dry_run):
     changes = {}
     for column in USER_DATAPOINT_COLUMNS:
         if column in item:
-            value, problem = _coerce_bool(item[column])
+            value, problem = DATAPOINT_COERCERS[column](item[column])
             if problem:
                 return {
                     "datapoint_id": datapoint_id,
@@ -1256,7 +1303,7 @@ async def _set_one_datapoint(store, cfg, live_dps, item, dry_run):
             "datapoint_id": datapoint_id,
             "status": "rejected",
             "problems": [
-                f"nothing to change - pass {' and/or '.join(USER_DATAPOINT_COLUMNS)}"
+                f"nothing to change - pass one of {', '.join(USER_DATAPOINT_COLUMNS)}"
             ],
         }
     payload = strip_platform(row)
