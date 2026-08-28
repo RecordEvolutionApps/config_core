@@ -3,9 +3,10 @@
 Ownership split: the app owns the row shape and validates it through ONE
 injected function (``validate(config, existing) -> (valid_config, problems)``,
 fail-closed); this module owns everything repetitive -- identity and
-protected-column rules, echo-merge partial updates, idempotent no-change
-skips, soft delete, read-back verification and the structured response
-envelope. What KIND of row is being managed comes in as an ``_Entity``
+protected-column rules, echo-merged validate candidates with diff-only
+writes (the platform's carry-over merge fills the rest), idempotent
+no-change skips, soft delete, read-back verification and the structured
+response envelope. What KIND of row is being managed comes in as an ``_Entity``
 (defaults, column hygiene, prose); the collector family's entity and its
 datapoint tools live in ``collector.py``, whose historical constants this
 module still re-exports via a lazy ``__getattr__`` at the bottom.
@@ -473,6 +474,19 @@ def _restamp(config, asset_name, device_key, audit, deleted=False):
     return row
 
 
+def _diff_payload(row, changed_fields):
+    """The wire payload for an update: ONLY the changed columns plus the
+    protected ones. The platform's carry-over merge (fleetdb entity tables)
+    fills the rest from the previous latest row, so untouched columns can
+    no longer clobber a concurrent writer's values. A column the validate
+    function dropped shows up in the diff with value None -- written as an
+    explicit null, which blanks it."""
+    payload = {column: row.get(column) for column in changed_fields}
+    for column in ("asset_name", "gateway_id", "deleted", "tsp"):
+        payload[column] = row[column]
+    return payload
+
+
 def _row_size_problem(row):
     try:
         encoded = json.dumps(row, default=str)
@@ -733,6 +747,13 @@ async def create_asset(store, cfg, asset_name, fields=None, dry_run=False):
             "This is an app-side validator bug; report it.",
         )
     row = coerced_row
+    if existing is not None and existing.get("deleted"):
+        # The platform's carry-over merge crosses the tombstone: null out
+        # every column of the dead row the new configuration does not set,
+        # so a revived name cannot silently inherit stale values.
+        for column in strip_platform(existing):
+            if column not in row:
+                row[column] = None
     size_problem = _row_size_problem(row)
     if size_problem:
         return _rejected("limit_exceeded", [size_problem],
@@ -912,7 +933,9 @@ async def update_asset(store, cfg, asset_name, changes=None,
             warnings=warnings, ignored=ignored,
         )
 
-    acked, append_err = await store.append_asset(row)
+    acked, append_err = await store.append_asset(
+        _diff_payload(row, changed_fields)
+    )
     if not acked:
         await store.notify(
             f"update {noun} {name!r} failed: {append_err}",
@@ -1059,13 +1082,18 @@ async def delete_asset(store, cfg, asset_name, expected_tsp=None,
             warnings=warnings,
         )
 
-    tombstone = strip_platform(existing)
-    tombstone["deleted"] = True
+    # Partial tombstone: carry-over keeps the dead row's configuration
+    # visible (re-create hints, 'previous'-style undo) without echoing it.
+    tombstone = {
+        "asset_name": name,
+        "gateway_id": store.device_key,
+        "deleted": True,
+        "tsp": now_iso(),
+    }
     audit = cfg.audit()
     if audit:
         column, value = audit
         tombstone[column] = value
-    tombstone["tsp"] = now_iso()
     acked, append_err = await store.append_asset(tombstone)
     if not acked:
         await store.notify(

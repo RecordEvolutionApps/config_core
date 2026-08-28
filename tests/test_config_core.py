@@ -492,12 +492,14 @@ async def test_update_never_echoes_platform_columns():
     stored["datapoint_list"] = [{"id": "x"}]  # runtime key on the read row
     check(await handlers["update"](
         asset_name="Press 1", changes={"collect_interval": 30}))
+    # The wire payload must never carry runtime keys or platform columns --
+    # authid/device_key on the stored row are the platform's fresh stamps.
+    table, payload = fake.payloads[-1]
+    assert table == "assets"
+    assert "datapoint_list" not in payload
+    assert "authid" not in payload and "device_key" not in payload
     appended = fake.latest("assets", asset_name="Press 1")
-    assert "datapoint_list" not in appended
-    # authid/device_key on the appended row are the fake's fresh platform
-    # stamps, not echoes: the payload the library sent must not have them.
-    payload = {k: v for k, v in appended.items()}
-    assert payload["authid"] == f"device-{DEVICE_KEY}"
+    assert appended["authid"] == f"device-{DEVICE_KEY}"
 
 
 async def test_update_null_clears_omitted_preserves():
@@ -1211,6 +1213,103 @@ def test_collector_import_paths_survive():
             check=True,
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         )
+
+
+# ------------------------------------------- carry-over diff writes (1.3.0)
+
+
+async def test_update_writes_only_the_diff():
+    fake, _, _, handlers = make_tools(audit_column="configured_by")
+    seed_asset(fake, "Press 1", host="10.0.0.5", port=502)
+    check(await handlers["update"](
+        asset_name="Press 1", changes={"port": 1502}))
+    table, payload = fake.payloads[-1]
+    assert table == "assets"
+    # changed column + protected columns + first-time audit stamp, nothing else
+    assert set(payload) == {"port", "asset_name", "gateway_id", "deleted",
+                            "tsp", "configured_by"}
+    row = fake.latest("assets", asset_name="Press 1")
+    assert row["host"] == "10.0.0.5" and row["port"] == 1502  # carried over
+
+
+async def test_update_does_not_clobber_concurrent_edit():
+    """The lost-update carry-over kills: a board edit landing between our
+    read and our append survives, because we no longer echo its column."""
+
+    class RacingFake(FakeIronflock):
+        race = None  # full row a board user writes right after our read
+
+        async def getHistory(self, table, params):
+            rows = await super().getHistory(table, params)
+            if self.race is not None and table == "assets":
+                row, self.race = self.race, None
+                self.external_append("assets", row)
+            return rows
+
+    fake = RacingFake(device_key=DEVICE_KEY)
+    _, _, _, handlers = make_tools(fake=fake)
+    seed_asset(fake, "Press 1", host="10.0.0.5", port=502)
+    board_row = dict(strip_platform(fake.latest("assets", asset_name="Press 1")))
+    board_row.update(host="10.0.0.9", tsp=now_iso())
+    fake.race = board_row
+
+    response = check(await handlers["update"](
+        asset_name="Press 1", changes={"port": 1502}))
+    assert response["ok"] is True
+    row = fake.latest("assets", asset_name="Press 1")
+    assert row["port"] == 1502          # our change applied
+    assert row["host"] == "10.0.0.9"    # the board's concurrent edit survives
+
+
+async def test_recreate_deleted_name_nulls_stale_columns():
+    """Carry-over crosses the tombstone: create must explicitly null the
+    dead row's columns the new configuration does not set."""
+    fake, _, _, handlers = make_tools()
+    seed_asset(fake, "Press 1", deleted=True, host="10.0.0.5", rack=2)
+    response = check(await handlers["create"](
+        asset_name="Press 1", fields={"port": 502}))
+    assert response["ok"] is True
+    _, payload = fake.payloads[-1]
+    assert payload["host"] is None and payload["rack"] is None
+    row = fake.latest("assets", asset_name="Press 1")
+    assert row["host"] is None and row["port"] == 502
+    assert row["deleted"] is False
+
+
+async def test_delete_writes_partial_tombstones():
+    fake, _, _, handlers = make_tools(audit_column="configured_by")
+    seed_asset(fake, "Press 1", host="10.0.0.5")
+    seed_datapoint(fake, "Press 1", "temp", address="DB1.0")
+    response = check(await handlers["delete"](asset_name="Press 1"))
+    assert response["ok"] is True and response["datapoints_deleted"] == 1
+    asset_payloads = [p for t, p in fake.payloads if t == "assets"]
+    dp_payloads = [p for t, p in fake.payloads if t == "datapoints"]
+    assert set(asset_payloads[-1]) == {"asset_name", "gateway_id", "deleted",
+                                       "tsp", "configured_by"}
+    assert set(dp_payloads[-1]) == {"asset_name", "datapoint_id",
+                                    "gateway_id", "deleted", "tsp",
+                                    "configured_by"}
+    # carry-over keeps the dead rows' configuration visible
+    assert fake.latest("assets", asset_name="Press 1")["host"] == "10.0.0.5"
+    dead_dp = fake.latest("datapoints", asset_name="Press 1",
+                          datapoint_id="temp")
+    assert dead_dp["deleted"] is True and dead_dp["address"] == "DB1.0"
+
+
+async def test_set_datapoints_writes_partial():
+    fake, _, _, handlers = make_tools()
+    seed_asset(fake, "Press 1")
+    seed_datapoint(fake, "Press 1", "temp", address="DB1.0", enabled=True)
+    response = check(await handlers["set_datapoints"](
+        asset_name="Press 1", changes={"datapoint_id": "temp",
+                                       "enabled": False}))
+    assert response["applied"] == 1
+    _, payload = fake.payloads[-1]
+    assert set(payload) == {"asset_name", "datapoint_id", "gateway_id",
+                            "deleted", "tsp", "enabled"}
+    row = fake.latest("datapoints", asset_name="Press 1",
+                      datapoint_id="temp")
+    assert row["enabled"] is False and row["address"] == "DB1.0"
 
 
 # ------------------------------------------------------------------- misc

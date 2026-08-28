@@ -2,8 +2,13 @@
 
 Models the platform semantics the library depends on, honestly:
 
-- append_to_table stores rows per table and stamps the platform columns
-  (authid, device_key) the way fleetdb does; identity-key comparison is
+- append_to_table implements the fleetdb carry-over model for entity
+  tables: the payload is merged onto the previous latest row of the same
+  identity (columns present in the payload -- explicit null included --
+  overwrite; absent columns carry over, across tombstones too), then the
+  platform columns (authid, device_key) are stamped the way fleetdb does.
+  Raw pre-merge payloads are recorded in ``payloads`` so tests can assert
+  what actually went over the wire. Identity-key comparison is
   numeric-tolerant (the platform returns numeric columns as strings).
 - getHistory implements the >= 1.6.0 read model: the ``{"latest": True}``
   filterAnd marker returns the newest row per identity (the table's
@@ -48,6 +53,7 @@ class FakeIronflock:
         self.tables = {}          # table -> list of rows (insertion order)
         self.pending = []         # (table, row) appended but not yet visible
         self.calls = []           # (method, table_or_topic)
+        self.payloads = []        # (table, raw payload) before carry-over
         self.reported = []        # report_error recordings
         self.registered = {}      # topic -> handler
         self._failures = {}       # method -> [error message, ...]
@@ -105,12 +111,27 @@ class FakeIronflock:
 
     # ---------------------------------------------------------- SDK surface
 
+    def _carry_over_base(self, table, payload):
+        """The previous latest row of the payload's identity (committed or
+        pending), or None -- the fleetdb carry-over merge base."""
+        identity = _identity(table, payload)
+        base = None
+        for row in self.tables.get(table, []):
+            if _identity(table, row) == identity:
+                base = row
+        for pending_table, row in self.pending:
+            if pending_table == table and _identity(table, row) == identity:
+                base = row
+        return base
+
     async def append_to_table(self, table, payload):
         self.calls.append(("append_to_table", table))
         failed, value = self._maybe_fail("append_to_table")
         if failed:
             return value
-        row = dict(payload)
+        self.payloads.append((table, dict(payload)))
+        row = dict(self._carry_over_base(table, payload) or {})
+        row.update(payload)
         row["authid"] = f"device-{self.device_key}"
         row["device_key"] = self.device_key
         if self.defer_visibility:

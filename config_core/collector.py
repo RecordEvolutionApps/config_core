@@ -374,17 +374,25 @@ async def _set_one_datapoint(store, cfg, live_dps, item, dry_run):
                 f"nothing to change - pass one of {', '.join(USER_DATAPOINT_COLUMNS)}"
             ],
         }
-    payload = strip_platform(row)
-    payload.update(changes)
-    if not normalized_diff(payload, row):
+    merged = strip_platform(row)
+    merged.update(changes)
+    if not normalized_diff(merged, row):
         return {"datapoint_id": datapoint_id, "status": "no_change"}
     if dry_run:
         return {
             "datapoint_id": datapoint_id, "status": "dry_run",
             "would_write": changes,
         }
-    payload["deleted"] = bool(row.get("deleted", False))
-    payload["tsp"] = now_iso()
+    # Partial write: the platform's carry-over merge preserves the rest of
+    # the row (discovery-written columns included).
+    payload = {
+        "asset_name": row.get("asset_name"),
+        "datapoint_id": row.get("datapoint_id"),
+        "gateway_id": store.device_key,
+        "deleted": bool(row.get("deleted", False)),
+        "tsp": now_iso(),
+    }
+    payload.update(changes)
     acked, append_err = await store.append_datapoint(payload)
     if not acked:
         return {

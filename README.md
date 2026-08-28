@@ -226,12 +226,20 @@ steering text for the agent and are NOT part of the semver contract.
 
 ## Write semantics
 
-- **Append-only tables.** Assets live in an append-only table with identity
-  `(gateway_id, asset_name)`; the platform serves the latest row per
-  identity. An update is a full-row append: the library echo-merges the
-  existing row (minus the platform columns `tsp`/`latest_flag`/`authid`/
-  `device_key` and the runtime `datapoint_list` key) with your changes, so
-  **omitted fields are preserved and an explicit `null` blanks a field**.
+- **Append-only tables with carry-over.** Assets live in an append-only
+  table with identity `(gateway_id, asset_name)`; the platform serves the
+  latest row per identity and **merges every append onto it** (fleetdb
+  carry-over for entity tables — this library requires it): columns present
+  in the payload overwrite, absent columns carry over. For the agent the
+  semantics are unchanged — **omitted fields are preserved and an explicit
+  `null` blanks a field** — but an update now writes only the changed
+  columns, so it can no longer clobber a concurrent writer's edits to other
+  columns. The library still reads and echo-merges the stored row in memory
+  first: your validate function always sees the full candidate, and the
+  no-change skip / `changed_fields` diff / `previous` undo come from that
+  read. Creates write the full validated row; re-creating a deleted name
+  explicitly nulls the dead row's columns the new config does not set, so
+  carry-over across the tombstone cannot revive stale values.
 - **Idempotence.** Every applied asset write restarts that asset's
   collection task, so writes that change nothing are skipped
   (`no_change`, numeric/boolean-normalized comparison) — re-applying a
@@ -554,3 +562,11 @@ The `ironflock` SDK is **not** a dependency — the session handle is
 injected. Apps must pin `ironflock >= 1.6.0` (proper error propagation on
 every call; this library surfaces the SDK's error text to the agent and
 treats a legacy `None` return as failure defensively).
+
+**Platform floor:** since v1.3.0 writes are diff-only and depend on the
+fleetdb **carry-over merge for entity tables** (tables with
+`maintainLatestFlagFor`): an append is merged onto the previous latest row
+of its identity — payload columns (explicit `null` included) overwrite,
+absent columns carry over, across tombstones too. On a platform without
+carry-over, a partial append would drop every omitted column; pin v1.2.0
+there.

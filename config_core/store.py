@@ -13,6 +13,13 @@ in SQL. There is no physical ``latest_flag`` column anymore. Reads never
 filter on ``deleted`` -- the latest row of a deleted asset has
 ``deleted=true``, and the handlers need to see it (re-create hints, cascade
 re-sweeps), so live/deleted partitioning happens in the handlers.
+
+Writes rely on the fleetdb carry-over merge for entity tables: an appended
+payload is merged onto the previous latest row of its identity -- columns
+present in the payload (explicit null included) overwrite, absent columns
+carry over, across tombstones too. Mutations therefore send only the
+changed columns plus the identity/protected ones; full rows are written
+only on create (which explicitly nulls a revived name's stale columns).
 """
 
 import asyncio
@@ -39,7 +46,7 @@ def now_iso():
 
 def strip_platform(row):
     """Row minus platform-stamped columns and runtime keys -- the echo-merge
-    base for every write (the soft_delete_asset / bacnet backfill shape)."""
+    base for the validate candidate and the no-change comparison."""
     return {
         k: v
         for k, v in row.items()
@@ -281,11 +288,12 @@ class AssetStore:
     # ------------------------------------------------------------ cascade
 
     async def cascade_delete_datapoints(self, asset_name, audit=None):
-        """Soft-delete every live datapoints row of the asset (the
-        DatapointStore.prune echo shape). Best-effort per row; returns
-        ``(deleted_count, failures)`` where failures is a list of
-        "datapoint_id: error" strings. Convergent: re-running sweeps
-        whatever a partial run left behind."""
+        """Soft-delete every live datapoints row of the asset with partial
+        tombstones (the platform's carry-over merge preserves the rest of
+        each row). Best-effort per row; returns ``(deleted_count,
+        failures)`` where failures is a list of "datapoint_id: error"
+        strings. Convergent: re-running sweeps whatever a partial run left
+        behind."""
         rows, err = await self.read_datapoints(asset_name)
         if err is not None:
             return 0, [f"could not read datapoints: {err}"]
@@ -293,12 +301,16 @@ class AssetStore:
         for row in rows:
             if row.get("deleted"):
                 continue
-            payload = strip_platform(row)
-            payload["deleted"] = True
+            payload = {
+                "asset_name": asset_name,
+                "datapoint_id": row.get("datapoint_id"),
+                "gateway_id": self.device_key,
+                "deleted": True,
+                "tsp": now_iso(),
+            }
             if audit:
                 column, value = audit
                 payload[column] = value
-            payload["tsp"] = now_iso()
             acked, append_err = await self.append_datapoint(payload)
             if acked:
                 deleted += 1
