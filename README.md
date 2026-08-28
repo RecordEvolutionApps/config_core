@@ -1,18 +1,31 @@
 # config_core
 
-Agent-facing **asset configuration tools** for IronFlock collector apps: WAMP
-RPCs that let the platform's AI agents list, inspect, create, update and
-delete assets — plus toggle the per-datapoint switches — on the gateway the
-agent targets.
+Agent-facing **configuration tools** for IronFlock apps: WAMP RPCs that let
+the platform's AI agents list, inspect, create, update and delete an app's
+config rows on the gateway the agent targets.
+
+Two entry points, one wire contract:
+
+- **`register_asset_tools`** — the collector preset (MTConnect, Modbus,
+  BACnet, IO-Link, PLC, …): manages the `assets` / `datapoints` /
+  `assetstatus` tables, seeds and coerces the collector_core contract
+  columns, and adds the per-datapoint switch tools.
+- **`register_config_tools`** — the generic form for any other app: manages
+  ONE named-row config table of the app's choosing, seeds nothing the app
+  did not declare, and has no datapoint tools.
+
+Both register the same topics with the same parameter names and response
+envelope, so agent tool schemas and prompts written for one work for the
+other.
 
 ## Ownership principle
 
-The collector app owns its assets table. Its shape and configuration
-parameters differ per app and are decided by the app, not by this library.
+The app owns its config table. Its shape and configuration parameters
+differ per app and are decided by the app, not by this library.
 `config_core` encapsulates only the repetitive parts that are identical in
-every collector_core-based app: the reads, the append/echo-merge/soft-delete
-write mechanics, idempotent no-change skips, read-back verification and the
-never-raise agent responses. The app contributes exactly two things:
+every app: the reads, the append/echo-merge/soft-delete write mechanics,
+idempotent no-change skips, read-back verification and the never-raise
+agent responses. The app contributes exactly two things:
 
 1. **One validation function** — receives a candidate asset config and
    returns either problems or the valid (normalized, defaults applied)
@@ -68,6 +81,42 @@ gateway's instance and that instance only ever configures itself:
 `gateway_id` is hard-coded to the local device key on every read and write,
 and no tool accepts a gateway parameter.
 
+## Generic config tools (`register_config_tools`)
+
+For apps whose config rows are not collector assets — an egress connection,
+a target definition, any named-row config table:
+
+```python
+await register_config_tools(
+    ironflock, validate_my_row,
+    "connections",                     # the app's config table
+    noun="connection",                 # prose in hints and toasts
+    create_defaults={"enabled": True}, # seeded UNDER agent fields on create
+    status_table="assetstatus",        # or None: no live_status join
+    # topics=, name_pattern=, audit_column=, max_entries=200, device_key=
+)
+```
+
+Same return convention as `register_asset_tools` (failed topics, never
+raises) and the same wire contract: default topics
+`app_assets.list/get/create/update/delete`, parameter `asset_name`, identity
+`(gateway_id, asset_name)`, identical response envelope. The differences:
+
+- **Nothing is seeded beyond `create_defaults`.** A validate function that
+  rejects unknown columns works — an empty create passes it exactly
+  `asset_name` and `gateway_id` (plus your own declared defaults).
+- **No column coercion.** The collector's `enabled`/`demo_mode`/
+  `collect_interval`/`datapoint_spec` hygiene does not run; a string
+  `"false"` for a boolean column reaches your validate as-is. Coerce there.
+- **No datapoint tools**, no datapoint summary in `get`, no
+  `datapoints_deleted`/`datapoints_failed` fields on `delete`, no
+  `datapoint_spec` preview in `list`.
+- **`status_table=None`** also drops `live_status` from `list`/`get`.
+
+Everything else in this README — the validate contract, response envelope,
+write semantics, secret scan, concurrency — applies to both entry points;
+collector-only behavior is marked as such.
+
 ## The validate function (the app contract)
 
 ```python
@@ -93,6 +142,30 @@ re-stamps the protected columns (`asset_name`, `gateway_id`, `deleted`,
 audit column, fresh `tsp`) — a validate function cannot rename, move or
 tombstone an asset.
 
+### What `config` holds at call time
+
+| | create | update |
+|---|---|---|
+| base | the create defaults — preset: `CORE_DEFAULTS` (`datapoint_spec=""`, `collect_interval=5`, `enabled=True`, `demo_mode=False`); generic: your `create_defaults` or nothing | the stored row minus the platform columns `tsp`/`latest_flag`/`authid`/`device_key` |
+| on top | the agent's fields | the agent's changes (explicit `null` blanks, omitted keys stay) |
+| identity | `asset_name` and `gateway_id` already stamped | already in the stored row |
+| `existing` | `None` | the full stored row |
+
+Both paths run the protected-column partition and the secret scan on the
+agent's input **before** calling you — plus, on the collector preset only,
+the core-column coercion — so `config` never contains a write to a
+protected column. What you return is written verbatim after the re-stamp:
+anything left in the dict lands in the table, anything you drop does not.
+
+**Non-collector apps: do not use `register_asset_tools`.** Its create path
+seeds `CORE_DEFAULTS` whether or not your table has those columns, so a
+validate function that rejects unknown column names — the right behaviour
+against a hallucinating agent — rejects *every* create, an empty one
+included, naming `datapoint_spec`, `collect_interval` and `demo_mode`.
+`register_config_tools` exists precisely for this: it seeds only your own
+`create_defaults`. (It also seeds no `enabled=True` — an app whose contract
+is "missing `enabled` means OFF" simply leaves it out of its defaults.)
+
 ## Tools and topics
 
 | Operation        | Default topic          | Purpose |
@@ -102,10 +175,11 @@ tombstone an asset.
 | `create`         | `app_assets.create`    | new asset (collection starts immediately) |
 | `update`         | `app_assets.update`    | partial update via echo-merge |
 | `delete`         | `app_assets.delete`    | soft delete, cascades to datapoint rows |
-| `list_datapoints`| `app_datapoints.list`  | the live datapoint catalog of one asset |
-| `set_datapoints` | `app_datapoints.set`   | per-datapoint `enabled` / `change_detection` switches + `demo_value` / `demo_variance` |
+| `list_datapoints`| `app_datapoints.list`  | *(preset only)* the live datapoint catalog of one asset |
+| `set_datapoints` | `app_datapoints.set`   | *(preset only)* per-datapoint `enabled` / `change_detection` switches + `demo_value` / `demo_variance` |
 
 All apps share these topic names — the platform scopes the URIs per device.
+`register_config_tools` registers only the five `app_assets.*` operations.
 
 ## Response contract
 
@@ -126,21 +200,23 @@ dict tells it how to recover). Envelope:
 
 Notable per-tool fields:
 
-- **list** — `count`, `assets` (platform columns stripped, `datapoint_spec`
-  as `{chars, preview}`, `live_status` joined from assetstatus).
+- **list** — `count`, `assets` (platform columns stripped; preset adds
+  `datapoint_spec` as `{chars, preview}`; `live_status` joined from the
+  status table when one is configured).
 - **get** — `asset` (full row, spec capped at 32 KB in the response),
-  `live_status`, `datapoints` summary `{count, disabled, change_detection,
-  ids}`, `_meta` `{tsp, last_changed_by, auto_registered?, <audit_column>?}`.
+  `_meta` `{tsp, last_changed_by, auto_registered?, <audit_column>?}`;
+  `live_status` when a status table is configured; preset adds the
+  `datapoints` summary `{count, disabled, change_detection, ids}`.
   Unknown names return difflib `suggestions` plus the `available` names.
 - **create / update** — `applied` (the written row) or `would_write`
   (dry_run), `changed_fields` `{col: {from, to}}`, `previous` (pre-write row
   → one-call undo), `verified` (read-back confirmed our row is latest);
   `superseded: true` + `current` when a concurrent writer landed after us
   (`ok` stays true — our row is in the append-only history).
-- **delete** — `datapoints_deleted`, `datapoints_failed` (call again to
-  finish a partial cascade), `previous`.
-- **set_datapoints** — per-item `results`, `applied`/`no_change`/`rejected`
-  /`failed` counts.
+- **delete** — `previous`; preset adds `datapoints_deleted`,
+  `datapoints_failed` (call again to finish a partial cascade).
+- **set_datapoints** *(preset)* — per-item `results`,
+  `applied`/`no_change`/`rejected`/`failed` counts.
 
 Failure classes: `rejected` (your input; fix and retry), `conflict`
 (`expected_tsp` mismatch; re-read), `failed` (`link_error` /
@@ -182,7 +258,12 @@ steering text for the agent and are NOT part of the semver contract.
 - **Secrets never go into tables.** Column names matching
   password/token/key/certificate patterns and values containing PEM blocks,
   URL-embedded credentials or JWTs are rejected — use the platform secret
-  store / device environment.
+  store / device environment. The PEM rule is block-type-blind on purpose: a
+  **public certificate is refused too**, whatever the column is called, so
+  the agent cannot write a CA or client certificate and a create carrying one
+  fails as a whole. TLS apps let the user paste certificates into the app's
+  own form; editing such an asset later still works, because the scan only
+  sees the agent's changed fields, never the echo-merged row.
 - **Operator visibility.** Applied mutations emit an info toast (a live
   audit feed on the board); write failures and partial cascades warn;
   internal errors report as errors. Rejections and no-ops stay silent.
@@ -418,6 +499,10 @@ blocks set. Keep it in `required`.
 
 ## Prompt guidance (system-prompt text, shipped as constants)
 
+Both constants are written for the **collector preset** ("data flows",
+datapoint diagnostics); a `register_config_tools` app writes its own prompt
+text, reusing the write-discipline ideas as it sees fit.
+
 `config_core.RECOMMENDED_PROMPT_GUIDANCE` — the write discipline:
 
 > You can list, inspect, create, update and delete assets yourself with the
@@ -459,8 +544,9 @@ re-pin each consuming app.
 Semver is judged by the app- and agent-facing contract:
 
 - **MAJOR** — removing/renaming a response field or default topic, changing
-  the `register_asset_tools` or validate-function signature, tightening
-  core-column validation so previously-valid writes reject.
+  the `register_asset_tools` / `register_config_tools` or validate-function
+  signature, tightening core-column validation so previously-valid writes
+  reject.
 - **MINOR** — new optional response fields, parameters, tools or topics.
 - **PATCH** — hint/toast wording, suggestion quality, bug fixes.
 

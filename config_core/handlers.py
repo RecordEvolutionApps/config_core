@@ -1,12 +1,14 @@
-"""Agent-facing asset CRUD operations and their never-raise RPC wrappers.
+"""Agent-facing config CRUD operations and their never-raise RPC wrappers.
 
-Ownership split: the app owns the asset shape and validates it through ONE
+Ownership split: the app owns the row shape and validates it through ONE
 injected function (``validate(config, existing) -> (valid_config, problems)``,
 fail-closed); this module owns everything repetitive -- identity and
-protected-column rules, hygiene of the collector_core contract columns,
-echo-merge partial updates, idempotent no-change skips, soft delete with
-datapoints cascade, read-back verification and the structured response
-envelope.
+protected-column rules, echo-merge partial updates, idempotent no-change
+skips, soft delete, read-back verification and the structured response
+envelope. What KIND of row is being managed comes in as an ``_Entity``
+(defaults, column hygiene, prose); the collector family's entity and its
+datapoint tools live in ``collector.py``, whose historical constants this
+module still re-exports via a lazy ``__getattr__`` at the bottom.
 
 Every RPC handler tolerates every WAMP calling convention, NEVER raises (an
 exception would reach the AI agent as an opaque WAMP error, while a
@@ -18,6 +20,7 @@ import asyncio
 import difflib
 import json
 import re
+from dataclasses import dataclass
 
 from .store import (
     PLATFORM_COLUMNS,
@@ -32,30 +35,19 @@ from .store import (
 # Rejection messages quote the active pattern, so overrides stay truthful.
 ASSET_NAME_PATTERN = r"^[a-zA-Z0-9 ]{3,50}$"
 
-# collector_core contract columns present in every collector app. The library
-# owns their hygiene and create defaults; everything else in a row belongs to
-# the app and passes through to its validate function untouched.
-CORE_DEFAULTS = {
-    "datapoint_spec": "",
-    "collect_interval": 5,
-    "enabled": True,
-    "demo_mode": False,
-}
-BOOL_COLUMNS = ("enabled", "demo_mode")
-
-# The only datapoint columns a user/agent owns; everything else is written by
-# discovery/spec parsing and would be overwritten (collector_core
-# USER_DATAPOINT_COLUMNS -- kept identical, order included, by a drift test in
-# each consuming app). The two switches gate what is collected and stored; the
-# two demo settings shape what demo mode produces for the datapoint.
-USER_DATAPOINT_COLUMNS = ("enabled", "change_detection", "demo_value", "demo_variance")
-
 # Secrets never go into tables (platform contract). Column-name denylist plus
 # cheap value heuristics; no entropy scoring (false-positive prone).
 SECRET_NAME_RE = re.compile(
     r"(?i)(password|passwd|pwd|secret|token|api[_-]?key|credential"
     r"|private[_-]?key|passphrase|certificate)"
 )
+# The PEM rule is deliberately block-type-blind: a public certificate is
+# refused exactly like a private key, even though SECRET_NAME_RE lets column
+# names like tls_ca and tls_client_cert through. Decided 2026-08-28 for
+# datarelay: the USER pastes certificates into the app's own form, the agent
+# never writes them. Splitting CERTIFICATE off from PRIVATE KEY here is a
+# product change, not a bug fix -- datarelay's assistant prompt and a drift
+# test in its suite pin this behaviour and have to move with it.
 SECRET_VALUE_RES = (
     (re.compile(r"-----BEGIN "), "a PEM certificate/key block"),
     (re.compile(r"://[^/\s@]+:[^/\s@]+@"), "a URL with embedded credentials"),
@@ -66,60 +58,115 @@ SECRET_HINT = (
     "platform secret store / device environment instead."
 )
 
-MAX_SPEC_CHARS = 65536
 MAX_ROW_CHARS = 131072
 MAX_SPEC_RETURN_CHARS = 32768
-DATAPOINT_BATCH_CAP = 100
 DATAPOINT_ID_PREVIEW = 50
 
 TRUE_STRINGS = ("true", "yes", "1")
 FALSE_STRINGS = ("false", "no", "0")
 
-RECOMMENDED_PROMPT_GUIDANCE = (
-    "You can list, inspect, create, update and delete assets yourself with "
-    "the asset tools. Every one of them runs ON a gateway and needs its "
-    "device_key: take it from list_devices, ask the user which gateway if "
-    "several run this app, and keep the same one all session - assets are "
-    "per gateway. Before any create/update/delete: run it with dry_run "
-    "true, show the user exactly what will change and apply only after they "
-    "agree. After applying, verify with get_asset a few seconds later - "
-    "status online means data flows. Renaming means create new + delete old."
-)
 
-SQL_DIAGNOSTICS_GUIDANCE = (
-    "Diagnose problems with SQL on this app's own tables (read access):\n"
-    "- error-logs (tsp, level, msg, user_message): recent errors, newest "
-    "first. There is no asset column - the asset name is prefixed into msg, "
-    "filter with msg LIKE 'AssetName: %'.\n"
-    "- measurements (tsp, asset_name, data): the collected batches; data is "
-    "JSON keyed by datapoint id. No errors does NOT mean correct data - "
-    "check for nulls and implausible magnitudes; those usually mean a wrong "
-    "address, data_type, scale or byte order in the datapoint spec.\n"
-    "- assetstatus (tsp, asset_name, status, detail): status history.\n"
-    "- assets/datapoints hold config history: always add the latest filter "
-    "and deleted = false; prefer the asset tools for config reads.\n"
-    "Caveats: change_detection datapoints only appear when their value "
-    "changes; demo_mode values are synthetic; a gateway with store_data = "
-    "false stores no measurements at all.\n"
-    "Example - last errors for one asset:\n"
-    "  SELECT tsp, level, msg FROM \"error-logs\" "
-    "WHERE msg LIKE 'Press 1: %' ORDER BY tsp DESC LIMIT 20\n"
-    "Example - latest data batches:\n"
-    "  SELECT tsp, data FROM measurements "
-    "WHERE asset_name = 'Press 1' ORDER BY tsp DESC LIMIT 5"
-)
+@dataclass(frozen=True)
+class _Hints:
+    """The per-entity hint texts -- the only strings that differ between the
+    collector preset and a generic entity beyond the noun. Hint strings are
+    explicitly NOT part of the semver contract. Templates take ``{name}``
+    (pre-repr'd) and, for delete_dry_run, ``{dp_clause}``."""
+
+    list_nonempty: str
+    list_empty: str
+    get_deleted: str
+    get_offline: str        # suffix appended to the get hint; "" = never
+    get_paused: str         # suffix appended to the get hint; "" = never
+    create_revive: str      # warning when re-creating a deleted name
+    create_success: str
+    update_no_change: str
+    update_success: str
+    delete_dry_run: str
+    delete_success: str
+
+
+@dataclass(frozen=True)
+class _Entity:
+    """What kind of row the tools manage (internal; built by the register
+    functions, never by the app). ``noun`` shapes prose only -- the wire
+    vocabulary (``asset_name``, ``get_asset``, response fields) is identical
+    for every entity, so deployed agent prompts and tool schemas keep
+    working. ``create_defaults`` is seeded UNDER the agent's fields on
+    create. ``coerce`` is ``(fields) -> (fields, problems)`` column hygiene
+    run on the agent's input and on validate's returned row; None = validate
+    owns all typing."""
+
+    noun: str
+    create_defaults: dict
+    coerce: object          # callable or None
+    hints: _Hints
+
+
+def _generic_hints(noun):
+    """Neutral hint texts for an entity without collector semantics."""
+    return _Hints(
+        list_nonempty=(
+            f"Fetch one {noun}'s full configuration with get_asset. To "
+            "modify, use update_asset with ONLY the fields to change."
+        ),
+        list_empty=(
+            f"No {noun}s configured on this gateway yet - create one with "
+            "create_asset (dry_run first)."
+        ),
+        get_deleted=(
+            f"{noun.capitalize()} {{name}} was deleted. create_asset "
+            "re-creates it under the same name."
+        ),
+        get_offline=(
+            f" The {noun} is offline - 'detail' holds the last error."
+        ),
+        get_paused="",
+        create_revive=(
+            "{name} previously existed and was deleted - re-creating "
+            "revives the name"
+        ),
+        create_success="Created. Verify with get_asset in a few seconds.",
+        update_no_change=(
+            f"The {noun} is already configured this way - nothing was "
+            "written."
+        ),
+        update_success="Updated. Verify with get_asset in a few seconds.",
+        delete_dry_run=(
+            f"Would soft-delete {noun} {{name}}. The name becomes reusable. "
+            "Confirm with the user, then re-call with dry_run=false."
+        ),
+        delete_success=(
+            "Soft-deleted. To undo, call create_asset with the values in "
+            "'previous'."
+        ),
+    )
+
+
+def _entity_coerce(cfg, fields):
+    """Run the entity's column hygiene, or pass through when it has none."""
+    if cfg.entity.coerce is None:
+        return dict(fields), []
+    return cfg.entity.coerce(fields)
 
 
 class ToolConfig:
     """Internal holder for the per-registration settings (built by
-    register_asset_tools, never by the app)."""
+    register_asset_tools / register_config_tools, never by the app)."""
 
     def __init__(self, validate, name_pattern=ASSET_NAME_PATTERN,
-                 audit_column=None, max_assets=200):
+                 audit_column=None, max_assets=200, entity=None):
         self.validate = validate
         self.name_pattern = re.compile(name_pattern)
         self.audit_column = audit_column
         self.max_assets = max_assets
+        # None = the collector preset entity: keeps ToolConfig(validate)
+        # meaning exactly what it did before entities existed. Imported
+        # lazily -- collector.py imports this module at its top.
+        if entity is None:
+            from .collector import _COLLECTOR_ENTITY
+            entity = _COLLECTOR_ENTITY
+        self.entity = entity
         # One lock per registration: serializes read->merge->append->verify
         # so two concurrent agent calls cannot lose each other's writes.
         self.lock = asyncio.Lock()
@@ -166,25 +213,6 @@ def _parse_object_param(value, param_name):
             return parsed, None
         return None, f"{param_name} must be an object, got {type(parsed).__name__}"
     return None, f"{param_name} must be an object, got {type(value).__name__}"
-
-
-def _parse_changes_param(value):
-    """(list_of_dicts, problem) for set_datapoints ``changes``: one dict, a
-    list of dicts, or their JSON-string forms."""
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except ValueError:
-            return None, "changes must be an object or array (got unparsable string)"
-    if isinstance(value, dict):
-        value = [value]
-    if not isinstance(value, list) or not value:
-        return None, "changes must be a non-empty object or array of objects"
-    if not all(isinstance(item, dict) for item in value):
-        return None, "every changes entry must be an object"
-    if len(value) > DATAPOINT_BATCH_CAP:
-        return None, f"changes is capped at {DATAPOINT_BATCH_CAP} entries per call"
-    return value, None
 
 
 def _parse_bool_param(value, param_name, default=False):
@@ -239,19 +267,20 @@ def _failed(code, error, hint, **extra):
     return response
 
 
-def _not_found(asset_name, rows, extra_hint=""):
+def _not_found(cfg, asset_name, rows, extra_hint=""):
+    noun = cfg.entity.noun
     names = sorted(
         {r.get("asset_name") for r in rows if not r.get("deleted")} - {None}
     )
     suggestions = _suggest(asset_name, names)
     hint = (
-        f"No asset named {asset_name!r} on this gateway."
+        f"No {noun} named {asset_name!r} on this gateway."
         + (f" Closest matches: {', '.join(suggestions)}." if suggestions else "")
         + " Call list_assets to see what exists."
         + (f" {extra_hint}" if extra_hint else "")
     )
     return _rejected(
-        "not_found", [f"asset {asset_name!r} not found"], hint,
+        "not_found", [f"{noun} {asset_name!r} not found"], hint,
         suggestions=suggestions, available=names,
     )
 
@@ -379,71 +408,6 @@ def _coerce_number(value):
     return None, f"{value!r} is not a number"
 
 
-def _coerce_demo_value(value):
-    """(setting_or_None, problem_or_None) -- a number, or a boolean for a
-    datapoint that rests in a state. Numbers win where both parse (``1`` is a
-    reading of one, not "on"); an explicit null restores the default range."""
-    if value is None or isinstance(value, bool):
-        return value, None
-    number, problem = _coerce_number(value)
-    if problem is None:
-        return number, None
-    boolean, _ = _coerce_bool(value)
-    if boolean is not None:
-        return boolean, None
-    return None, f"{value!r} is not a number or a boolean"
-
-
-# Per-column coercion for the user-owned datapoint columns: the switches are
-# strict booleans, the demo settings numbers (demo_value also takes a boolean).
-DATAPOINT_COERCERS = {
-    "enabled": _coerce_bool,
-    "change_detection": _coerce_bool,
-    "demo_value": _coerce_demo_value,
-    "demo_variance": _coerce_number,
-}
-
-
-def _coerce_core(fields):
-    """P2: hygiene of the collector_core contract columns. Returns
-    (coerced_fields, problems). Explicit None passes through (null semantics
-    are handled by the merge); app columns pass through untouched."""
-    coerced, problems = dict(fields), []
-    for column in BOOL_COLUMNS:
-        if column in coerced and coerced[column] is not None:
-            value, problem = _coerce_bool(coerced[column])
-            if problem:
-                problems.append(f"{column}: {problem}")
-            else:
-                coerced[column] = value
-    if "collect_interval" in coerced and coerced["collect_interval"] is not None:
-        value = coerced["collect_interval"]
-        if isinstance(value, bool):
-            problems.append("collect_interval: must be a number of seconds")
-        else:
-            try:
-                interval = int(round(float(value)))
-            except (TypeError, ValueError):
-                problems.append(
-                    f"collect_interval: {value!r} is not a number of seconds"
-                )
-            else:
-                if interval < 1:
-                    problems.append("collect_interval: must be >= 1 second")
-                else:
-                    coerced["collect_interval"] = interval
-    if "datapoint_spec" in coerced and coerced["datapoint_spec"] is not None:
-        spec = coerced["datapoint_spec"]
-        if not isinstance(spec, str):
-            problems.append("datapoint_spec: must be a string")
-        elif len(spec) > MAX_SPEC_CHARS:
-            problems.append(
-                f"datapoint_spec: too large ({len(spec)} chars, max "
-                f"{MAX_SPEC_CHARS})"
-            )
-    return coerced, problems
-
-
 def _secret_scan(fields):
     """P3: reject secret-looking column names and values in the agent's
     input (echoed existing columns are not re-scanned)."""
@@ -560,7 +524,8 @@ async def _mutation_prelude(store, cfg, asset_name):
     if problems:
         return name, [], _rejected(
             "invalid_name", problems,
-            f"Asset names must match {cfg.name_pattern.pattern}.",
+            f"{cfg.entity.noun.capitalize()} names must match "
+            f"{cfg.name_pattern.pattern}.",
         )
     rows, err = await store.read_assets()
     if err is not None:
@@ -578,24 +543,28 @@ async def list_assets(store, cfg, include_deleted=False):
         return _link_failed(err)
     live, deleted = _split_rows(rows)
     warnings = []
-    status_rows, status_err = await store.read_statuses()
-    statuses = _status_map(status_rows)
-    if status_err is not None:
-        warnings.append(f"live status unavailable: {status_err}")
+    statuses = {}
+    if store.status_table:
+        status_rows, status_err = await store.read_statuses()
+        statuses = _status_map(status_rows)
+        if status_err is not None:
+            warnings.append(f"live status unavailable: {status_err}")
 
     def entry(row):
         stripped = strip_platform(row)
-        spec = stripped.pop("datapoint_spec", None)
-        if isinstance(spec, str) and spec:
-            stripped["datapoint_spec"] = {
-                "chars": len(spec),
-                "preview": spec[:200],
-            }
-        else:
-            stripped["datapoint_spec"] = {"chars": 0, "preview": ""}
-        stripped["live_status"] = statuses.get(
-            row.get("asset_name"), {"status": "unknown"}
-        )
+        if store.datapoints_table:
+            spec = stripped.pop("datapoint_spec", None)
+            if isinstance(spec, str) and spec:
+                stripped["datapoint_spec"] = {
+                    "chars": len(spec),
+                    "preview": spec[:200],
+                }
+            else:
+                stripped["datapoint_spec"] = {"chars": 0, "preview": ""}
+        if store.status_table:
+            stripped["live_status"] = statuses.get(
+                row.get("asset_name"), {"status": "unknown"}
+            )
         return stripped
 
     assets = sorted(
@@ -605,17 +574,8 @@ async def list_assets(store, cfg, include_deleted=False):
         assets += sorted(
             (entry(r) for r in deleted), key=lambda e: e.get("asset_name") or ""
         )
-    if assets:
-        hint = (
-            "Fetch one asset's full configuration, live status and datapoint "
-            "summary with get_asset. status online = data is flowing; "
-            "offline shows the last connection error in detail."
-        )
-    else:
-        hint = (
-            "No assets configured on this gateway yet - create one with "
-            "create_asset (dry_run first)."
-        )
+    hint = (cfg.entity.hints.list_nonempty if assets
+            else cfg.entity.hints.list_empty)
     return _finish(
         _ok("ok", hint, count=len(assets), assets=assets), warnings=warnings
     )
@@ -626,42 +586,47 @@ async def get_asset(store, cfg, asset_name):
     if problems:
         return _rejected(
             "invalid_name", problems,
-            f"Asset names must match {cfg.name_pattern.pattern}.",
+            f"{cfg.entity.noun.capitalize()} names must match "
+            f"{cfg.name_pattern.pattern}.",
         )
     rows, err = await store.read_assets()
     if err is not None:
         return _link_failed(err)
     row = next((r for r in rows if r.get("asset_name") == name), None)
     if row is None:
-        return _not_found(name, rows)
+        return _not_found(cfg, name, rows)
     if row.get("deleted"):
         return _ok(
             "ok",
-            f"Asset {name!r} was deleted. create_asset re-creates it under "
-            "the same name (measurement history under this name resumes).",
+            cfg.entity.hints.get_deleted.format(name=repr(name)),
             found=True, deleted=True, asset=_spec_for_response(strip_platform(row)),
         )
 
     warnings = []
-    status_rows, status_err = await store.read_statuses()
-    if status_err is not None:
-        warnings.append(f"live status unavailable: {status_err}")
-    live_status = _status_map(status_rows).get(name)
+    extra = {}
+    live_status = None
+    if store.status_table:
+        status_rows, status_err = await store.read_statuses()
+        if status_err is not None:
+            warnings.append(f"live status unavailable: {status_err}")
+        live_status = _status_map(status_rows).get(name)
+        extra["live_status"] = live_status
 
-    dp_rows, dp_err = await store.read_datapoints(name)
-    if dp_err is not None:
-        warnings.append(f"datapoint catalog unavailable: {dp_err}")
-    live_dps = [r for r in dp_rows if not r.get("deleted")]
-    datapoints = {
-        "count": len(live_dps),
-        "disabled": sum(1 for r in live_dps if r.get("enabled") is False),
-        "change_detection": sum(
-            1 for r in live_dps if bool(r.get("change_detection"))
-        ),
-        "ids": sorted(
-            str(r.get("datapoint_id")) for r in live_dps
-        )[:DATAPOINT_ID_PREVIEW],
-    }
+    if store.datapoints_table:
+        dp_rows, dp_err = await store.read_datapoints(name)
+        if dp_err is not None:
+            warnings.append(f"datapoint catalog unavailable: {dp_err}")
+        live_dps = [r for r in dp_rows if not r.get("deleted")]
+        extra["datapoints"] = {
+            "count": len(live_dps),
+            "disabled": sum(1 for r in live_dps if r.get("enabled") is False),
+            "change_detection": sum(
+                1 for r in live_dps if bool(r.get("change_detection"))
+            ),
+            "ids": sorted(
+                str(r.get("datapoint_id")) for r in live_dps
+            )[:DATAPOINT_ID_PREVIEW],
+        }
 
     meta = {"tsp": row.get("tsp"), "last_changed_by": row.get("authid")}
     if "auto_registered" in row:
@@ -674,22 +639,17 @@ async def get_asset(store, cfg, asset_name):
         f"expected_tsp={row.get('tsp')!r} to guard against concurrent edits."
     )
     status_value = (live_status or {}).get("status")
-    if status_value == "offline":
-        hint += (
-            " The asset is offline: query the error-logs table for its "
-            "recent errors (see your diagnostics instructions) and propose "
-            "a remedy."
-        )
-    elif status_value == "paused":
-        hint += " The asset is paused - update_asset with enabled=true resumes it."
+    if status_value == "offline" and cfg.entity.hints.get_offline:
+        hint += cfg.entity.hints.get_offline
+    elif status_value == "paused" and cfg.entity.hints.get_paused:
+        hint += cfg.entity.hints.get_paused
     return _finish(
         _ok(
             "ok", hint,
             found=True,
             asset=_spec_for_response(strip_platform(row)),
-            live_status=live_status,
-            datapoints=datapoints,
             _meta=meta,
+            **extra,
         ),
         warnings=warnings,
     )
@@ -705,32 +665,32 @@ async def create_asset(store, cfg, asset_name, fields=None, dry_run=False):
     if early is not None:
         return early
 
+    noun = cfg.entity.noun
     live, _ = _split_rows(rows)
     existing = next((r for r in rows if r.get("asset_name") == name), None)
     warnings, ignored = [], []
     if existing is not None and not existing.get("deleted"):
         return _rejected(
             "already_exists",
-            [f"asset {name!r} already exists on this gateway"],
-            "Asset names are unique per gateway - use update_asset to change "
-            "it, or choose a different name.",
+            [f"{noun} {name!r} already exists on this gateway"],
+            f"{noun.capitalize()} names are unique per gateway - use "
+            "update_asset to change it, or choose a different name.",
             asset=_spec_for_response(strip_platform(existing)),
         )
     if existing is not None and existing.get("deleted"):
-        warnings.append(
-            f"{name!r} previously existed and was deleted - re-creating "
-            "revives the name and measurement history under it resumes"
-        )
+        warnings.append(cfg.entity.hints.create_revive.format(name=repr(name)))
     for row in live:
         other = row.get("asset_name") or ""
         if other != name and other.casefold() == name.casefold():
-            warnings.append(f"a similarly named asset {other!r} already exists")
+            warnings.append(
+                f"a similarly named {noun} {other!r} already exists"
+            )
     if len(live) >= cfg.max_assets:
         return _rejected(
             "limit_exceeded",
-            [f"this gateway already has {len(live)} assets (limit "
+            [f"this gateway already has {len(live)} {noun}s (limit "
              f"{cfg.max_assets})"],
-            "Delete unused assets first, or raise the limit in the app.",
+            f"Delete unused {noun}s first, or raise the limit in the app.",
         )
 
     clean, problems, ignored = _partition_fields(fields, name, store.device_key)
@@ -740,9 +700,9 @@ async def create_asset(store, cfg, asset_name, fields=None, dry_run=False):
                       "Remove the protected fields and retry."),
             ignored=ignored,
         )
-    candidate = dict(CORE_DEFAULTS)
+    candidate = dict(cfg.entity.create_defaults)
     candidate.update(clean)
-    candidate, problems = _coerce_core(candidate)
+    candidate, problems = _entity_coerce(cfg, candidate)
     if problems:
         return _finish(
             _rejected("invalid_value", problems, "Fix the listed values."),
@@ -764,7 +724,7 @@ async def create_asset(store, cfg, asset_name, fields=None, dry_run=False):
             ignored=ignored,
         )
     row = _restamp(config, name, store.device_key, cfg.audit())
-    coerced_row, problems = _coerce_core(row)
+    coerced_row, problems = _entity_coerce(cfg, row)
     if problems:
         return _rejected(
             "validation_error",
@@ -794,10 +754,10 @@ async def create_asset(store, cfg, asset_name, fields=None, dry_run=False):
     acked, append_err = await store.append_asset(row)
     if not acked:
         await store.notify(
-            f"create asset {name!r} failed: {append_err}",
+            f"create {noun} {name!r} failed: {append_err}",
             level="warn",
             user_message=(
-                f"The AI assistant could not create asset '{name}' - "
+                f"The AI assistant could not create {noun} '{name}' - "
                 "platform connection problem."
             ),
         )
@@ -808,21 +768,15 @@ async def create_asset(store, cfg, asset_name, fields=None, dry_run=False):
         )
     verdict, latest, detail = await store.verify_asset(name, row["tsp"])
     await store.notify(
-        f"agent created asset {name!r}",
+        f"agent created {noun} {name!r}",
         level="info",
-        user_message=f"AI assistant created asset '{name}'.",
+        user_message=f"AI assistant created {noun} '{name}'.",
     )
     return _finish(
         _build_write_response(
             "applied", name, row, verdict, latest, detail,
             created=True,
-            success_hint=(
-                "Created. The collector starts this asset now - call "
-                "get_asset in ~15 seconds: status online means data is "
-                "flowing, offline shows the connection error. Consider "
-                "demo_mode=true to validate dashboards before touching "
-                "real hardware."
-            ),
+            success_hint=cfg.entity.hints.create_success,
         ),
         warnings=warnings, ignored=ignored,
     )
@@ -842,13 +796,14 @@ async def update_asset(store, cfg, asset_name, changes=None,
     name, rows, early = await _mutation_prelude(store, cfg, asset_name)
     if early is not None:
         return early
+    noun = cfg.entity.noun
     existing = next((r for r in rows if r.get("asset_name") == name), None)
     if existing is None:
-        return _not_found(name, rows)
+        return _not_found(cfg, name, rows)
     if existing.get("deleted"):
         return _rejected(
             "not_found",
-            [f"asset {name!r} was deleted"],
+            [f"{noun} {name!r} was deleted"],
             "Use create_asset to re-create it - 'previous' holds its last "
             "configuration.",
             previous=strip_platform(existing),
@@ -874,7 +829,7 @@ async def update_asset(store, cfg, asset_name, changes=None,
     warnings = []
     if existing.get("auto_registered"):
         warnings.append(
-            "this asset is maintained by network discovery - the scanner "
+            f"this {noun} is maintained by network discovery - the scanner "
             "may re-write identity fields"
         )
     clean, problems, ignored = _partition_fields(changes, name, store.device_key)
@@ -894,7 +849,7 @@ async def update_asset(store, cfg, asset_name, changes=None,
             ),
             warnings=warnings, ignored=ignored,
         )
-    clean, problems = _coerce_core(clean)
+    clean, problems = _entity_coerce(cfg, clean)
     if problems:
         return _finish(
             _rejected("invalid_value", problems, "Fix the listed values."),
@@ -918,7 +873,7 @@ async def update_asset(store, cfg, asset_name, changes=None,
             ignored=ignored,
         )
     row = _restamp(config, name, store.device_key, cfg.audit())
-    coerced_row, problems = _coerce_core(row)
+    coerced_row, problems = _entity_coerce(cfg, row)
     if problems:
         return _rejected(
             "validation_error",
@@ -937,8 +892,7 @@ async def update_asset(store, cfg, asset_name, changes=None,
         return _finish(
             _ok(
                 "no_change",
-                "The asset is already configured this way - nothing was "
-                "written (a write would restart its collection task).",
+                cfg.entity.hints.update_no_change,
                 changed=False,
             ),
             warnings=warnings, ignored=ignored,
@@ -961,10 +915,10 @@ async def update_asset(store, cfg, asset_name, changes=None,
     acked, append_err = await store.append_asset(row)
     if not acked:
         await store.notify(
-            f"update asset {name!r} failed: {append_err}",
+            f"update {noun} {name!r} failed: {append_err}",
             level="warn",
             user_message=(
-                f"The AI assistant could not update asset '{name}' - "
+                f"The AI assistant could not update {noun} '{name}' - "
                 "platform connection problem."
             ),
         )
@@ -979,20 +933,16 @@ async def update_asset(store, cfg, asset_name, changes=None,
         for col, change in sorted(changed_fields.items())
     )
     await store.notify(
-        f"agent updated asset {name!r}: {summary}",
+        f"agent updated {noun} {name!r}: {summary}",
         level="info",
-        user_message=f"AI assistant updated asset '{name}': {summary}"[:500],
+        user_message=f"AI assistant updated {noun} '{name}': {summary}"[:500],
     )
     return _finish(
         _build_write_response(
             "applied", name, row, verdict, latest, detail,
             updated=True, changed_fields=changed_fields,
             previous=strip_platform(existing),
-            success_hint=(
-                "Updated and the collection task restarts with the new "
-                "configuration - a brief offline/online flicker is normal. "
-                "Verify with get_asset in ~15 seconds."
-            ),
+            success_hint=cfg.entity.hints.update_success,
         ),
         warnings=warnings, ignored=ignored,
     )
@@ -1029,24 +979,26 @@ async def delete_asset(store, cfg, asset_name, expected_tsp=None,
     name, rows, early = await _mutation_prelude(store, cfg, asset_name)
     if early is not None:
         return early
+    noun = cfg.entity.noun
     existing = next((r for r in rows if r.get("asset_name") == name), None)
     if existing is None:
         return _not_found(
-            name, rows, extra_hint="Nothing was deleted."
+            cfg, name, rows, extra_hint="Nothing was deleted."
         )
 
-    dp_rows, dp_err = await store.read_datapoints(name)
-    live_dps = [r for r in dp_rows if not r.get("deleted")]
-    warnings = []
-    if dp_err is not None:
-        warnings.append(f"datapoint catalog unavailable: {dp_err}")
+    live_dps, warnings = [], []
+    if store.datapoints_table:
+        dp_rows, dp_err = await store.read_datapoints(name)
+        live_dps = [r for r in dp_rows if not r.get("deleted")]
+        if dp_err is not None:
+            warnings.append(f"datapoint catalog unavailable: {dp_err}")
 
     if existing.get("deleted"):
         # Convergent: finish whatever a partial earlier delete left behind.
         if not live_dps:
             return _ok(
                 "no_change",
-                f"Asset {name!r} is already deleted.",
+                f"{noun.capitalize()} {name!r} is already deleted.",
                 changed=False,
             )
         if dry_run:
@@ -1089,15 +1041,20 @@ async def delete_asset(store, cfg, asset_name, expected_tsp=None,
         }
 
     if dry_run:
+        extra = {}
+        dp_clause = ""
+        if store.datapoints_table:
+            dp_clause = f" and its {len(live_dps)} datapoint entries"
+            extra["datapoints_to_delete"] = len(live_dps)
         return _finish(
             _ok(
                 "dry_run",
-                f"Would soft-delete asset {name!r} and its "
-                f"{len(live_dps)} datapoint entries. Measurement history "
-                "is retained; the name becomes reusable. Confirm with the "
-                "user, then re-call with dry_run=false.",
-                changed=True, datapoints_to_delete=len(live_dps),
+                cfg.entity.hints.delete_dry_run.format(
+                    name=repr(name), dp_clause=dp_clause
+                ),
+                changed=True,
                 previous=_spec_for_response(strip_platform(existing)),
+                **extra,
             ),
             warnings=warnings,
         )
@@ -1112,10 +1069,10 @@ async def delete_asset(store, cfg, asset_name, expected_tsp=None,
     acked, append_err = await store.append_asset(tombstone)
     if not acked:
         await store.notify(
-            f"delete asset {name!r} failed: {append_err}",
+            f"delete {noun} {name!r} failed: {append_err}",
             level="warn",
             user_message=(
-                f"The AI assistant could not delete asset '{name}' - "
+                f"The AI assistant could not delete {noun} '{name}' - "
                 "platform connection problem."
             ),
         )
@@ -1125,24 +1082,31 @@ async def delete_asset(store, cfg, asset_name, expected_tsp=None,
             "then retry.",
         )
 
-    deleted_count, failures = await store.cascade_delete_datapoints(
-        name, audit=cfg.audit()
-    )
+    extra = {}
+    deleted_count, failures = 0, []
+    if store.datapoints_table:
+        deleted_count, failures = await store.cascade_delete_datapoints(
+            name, audit=cfg.audit()
+        )
+        extra["datapoints_deleted"] = deleted_count
+        extra["datapoints_failed"] = len(failures)
     verdict, _, detail = await store.verify_asset(name, tombstone["tsp"])
-    toast = f"AI assistant deleted asset '{name}'"
+    toast = f"AI assistant deleted {noun} '{name}'"
     if deleted_count:
         toast += f" ({deleted_count} datapoint entries removed)"
+    if store.datapoints_table:
+        message = (
+            f"agent deleted {noun} {name!r} "
+            f"(datapoints removed: {deleted_count}, failed: {len(failures)})"
+        )
+    else:
+        message = f"agent deleted {noun} {name!r}"
     await store.notify(
-        f"agent deleted asset {name!r} "
-        f"(datapoints removed: {deleted_count}, failed: {len(failures)})",
+        message,
         level="warn" if failures else "info",
         user_message=toast + ".",
     )
-    hint = (
-        "Soft-deleted: the collector stops the asset's collection task and "
-        "measurement history is retained. To undo, call create_asset with "
-        "the values in 'previous'."
-    )
+    hint = cfg.entity.hints.delete_success
     if failures:
         hint += (
             f" {len(failures)} datapoint entries could not be cleaned up - "
@@ -1159,172 +1123,11 @@ async def delete_asset(store, cfg, asset_name, expected_tsp=None,
             "deleted", hint,
             asset_name=name, changed=True,
             verified=verdict == "verified",
-            datapoints_deleted=deleted_count,
-            datapoints_failed=len(failures),
             previous=_spec_for_response(strip_platform(existing)),
+            **extra,
         ),
         warnings=warnings + failures,
     )
-
-
-async def list_datapoints(store, cfg, asset_name):
-    name, rows, early = await _mutation_prelude(store, cfg, asset_name)
-    if early is not None:
-        return early
-    existing = next((r for r in rows if r.get("asset_name") == name), None)
-    if existing is None:
-        return _not_found(name, rows)
-    dp_rows, dp_err = await store.read_datapoints(name)
-    if dp_err is not None:
-        return _link_failed(dp_err)
-    live_dps = sorted(
-        (strip_platform(r) for r in dp_rows if not r.get("deleted")),
-        key=lambda r: str(r.get("datapoint_id")),
-    )
-    return _ok(
-        "ok",
-        "Editable per-datapoint switches: enabled (false stops collecting "
-        "it) and change_detection (true stores only value changes) - use "
-        "set_datapoints. Everything else is derived from the asset's "
-        "configuration; change that instead.",
-        count=len(live_dps), datapoints=live_dps,
-    )
-
-
-async def set_datapoints(store, cfg, asset_name, changes=None, dry_run=False):
-    items, parse_problem = _parse_changes_param(changes)
-    if parse_problem:
-        return _rejected(
-            "invalid_value", [parse_problem],
-            "Pass changes as {datapoint_id, enabled?, change_detection?} or "
-            "an array of those.",
-        )
-    name, rows, early = await _mutation_prelude(store, cfg, asset_name)
-    if early is not None:
-        return early
-    existing = next((r for r in rows if r.get("asset_name") == name), None)
-    if existing is None:
-        return _not_found(name, rows)
-    dp_rows, dp_err = await store.read_datapoints(name)
-    if dp_err is not None:
-        return _link_failed(dp_err)
-    live_dps = {
-        str(r.get("datapoint_id")): r for r in dp_rows if not r.get("deleted")
-    }
-
-    results, applied, no_change, rejected, failed = [], 0, 0, 0, 0
-    for item in items:
-        result = await _set_one_datapoint(store, cfg, live_dps, item, dry_run)
-        results.append(result)
-        status = result["status"]
-        if status in ("applied", "dry_run"):
-            applied += 1
-        elif status == "no_change":
-            no_change += 1
-        elif status == "rejected":
-            rejected += 1
-        else:
-            failed += 1
-
-    if applied and not dry_run:
-        await store.notify(
-            f"agent changed {applied} datapoint switch(es) on asset {name!r}",
-            level="info",
-            user_message=(
-                f"AI assistant changed {applied} datapoint switch(es) on "
-                f"asset '{name}'."
-            ),
-        )
-    ok = rejected == 0 and failed == 0
-    hint = (
-        "Datapoint switches apply on the next publish cycle WITHOUT "
-        "restarting the asset's connection."
-    )
-    if dry_run:
-        hint = "Nothing was written (dry_run). " + hint
-    if rejected or failed:
-        hint = "Some entries were not applied - see results. " + hint
-    return {
-        "ok": ok,
-        "status": "ok" if ok else "rejected",
-        "results": results,
-        "applied": applied,
-        "no_change": no_change,
-        "rejected": rejected,
-        "failed": failed,
-        "hint": hint,
-    }
-
-
-async def _set_one_datapoint(store, cfg, live_dps, item, dry_run):
-    datapoint_id = str(item.get("datapoint_id") or "").strip()
-    if not datapoint_id:
-        return {
-            "datapoint_id": item.get("datapoint_id"),
-            "status": "rejected",
-            "problems": ["datapoint_id is required"],
-        }
-    extras = [
-        k for k in item
-        if k != "datapoint_id" and k not in USER_DATAPOINT_COLUMNS
-    ]
-    if extras:
-        return {
-            "datapoint_id": datapoint_id,
-            "status": "rejected",
-            "problems": [
-                f"only {', '.join(USER_DATAPOINT_COLUMNS)} are editable - "
-                f"{', '.join(sorted(extras))} is written by discovery/spec "
-                "parsing and would be overwritten; change the asset's "
-                "datapoint spec or the device instead"
-            ],
-        }
-    row = live_dps.get(datapoint_id)
-    if row is None:
-        return {
-            "datapoint_id": datapoint_id,
-            "status": "rejected",
-            "problems": [f"datapoint {datapoint_id!r} not found on this asset"],
-            "suggestions": _suggest(datapoint_id, sorted(live_dps)),
-        }
-    changes = {}
-    for column in USER_DATAPOINT_COLUMNS:
-        if column in item:
-            value, problem = DATAPOINT_COERCERS[column](item[column])
-            if problem:
-                return {
-                    "datapoint_id": datapoint_id,
-                    "status": "rejected",
-                    "problems": [f"{column}: {problem}"],
-                }
-            changes[column] = value
-    if not changes:
-        return {
-            "datapoint_id": datapoint_id,
-            "status": "rejected",
-            "problems": [
-                f"nothing to change - pass one of {', '.join(USER_DATAPOINT_COLUMNS)}"
-            ],
-        }
-    payload = strip_platform(row)
-    payload.update(changes)
-    if not normalized_diff(payload, row):
-        return {"datapoint_id": datapoint_id, "status": "no_change"}
-    if dry_run:
-        return {
-            "datapoint_id": datapoint_id, "status": "dry_run",
-            "would_write": changes,
-        }
-    payload["deleted"] = bool(row.get("deleted", False))
-    payload["tsp"] = now_iso()
-    acked, append_err = await store.append_datapoint(payload)
-    if not acked:
-        return {
-            "datapoint_id": datapoint_id, "status": "failed",
-            "error": append_err,
-        }
-    return {"datapoint_id": datapoint_id, "status": "applied",
-            "applied": changes}
 
 
 # --------------------------------------------------------------------------
@@ -1398,17 +1201,7 @@ def rpc_handlers(store, cfg):
         return await delete_asset(store, cfg, asset_name,
                                   expected_tsp=expected_tsp, dry_run=value)
 
-    async def _list_datapoints(asset_name=None):
-        return await list_datapoints(store, cfg, asset_name)
-
-    async def _set_datapoints(asset_name=None, changes=None, dry_run=False):
-        value, problem = _parse_bool_param(dry_run, "dry_run")
-        if problem:
-            return _rejected("invalid_value", [problem], "Pass a boolean.")
-        return await set_datapoints(store, cfg, asset_name, changes=changes,
-                                    dry_run=value)
-
-    return {
+    handlers = {
         "list": wrap(_list, ("include_deleted",), mutating=False),
         "get": wrap(_get, ("asset_name",), mutating=False),
         "create": wrap(_create, ("asset_name", "fields", "dry_run"),
@@ -1417,8 +1210,51 @@ def rpc_handlers(store, cfg):
                                  "dry_run"), mutating=True),
         "delete": wrap(_delete, ("asset_name", "expected_tsp", "dry_run"),
                        mutating=True),
-        "list_datapoints": wrap(_list_datapoints, ("asset_name",),
-                                mutating=False),
-        "set_datapoints": wrap(_set_datapoints, ("asset_name", "changes",
-                                                 "dry_run"), mutating=True),
     }
+
+    if store.datapoints_table:
+        from .collector import list_datapoints, set_datapoints
+
+        async def _list_datapoints(asset_name=None):
+            return await list_datapoints(store, cfg, asset_name)
+
+        async def _set_datapoints(asset_name=None, changes=None,
+                                  dry_run=False):
+            value, problem = _parse_bool_param(dry_run, "dry_run")
+            if problem:
+                return _rejected("invalid_value", [problem], "Pass a boolean.")
+            return await set_datapoints(store, cfg, asset_name,
+                                        changes=changes, dry_run=value)
+
+        handlers["list_datapoints"] = wrap(
+            _list_datapoints, ("asset_name",), mutating=False
+        )
+        handlers["set_datapoints"] = wrap(
+            _set_datapoints, ("asset_name", "changes", "dry_run"),
+            mutating=True,
+        )
+
+    return handlers
+
+
+# Historical import paths: these names lived here before the collector
+# preset moved to collector.py, and consuming apps pin them in drift tests
+# (e.g. config_core.handlers.USER_DATAPOINT_COLUMNS). Lazy so that
+# collector.py can import this module at its top without a cycle.
+_COLLECTOR_COMPAT = (
+    "CORE_DEFAULTS",
+    "BOOL_COLUMNS",
+    "USER_DATAPOINT_COLUMNS",
+    "DATAPOINT_COERCERS",
+    "MAX_SPEC_CHARS",
+    "DATAPOINT_BATCH_CAP",
+    "RECOMMENDED_PROMPT_GUIDANCE",
+    "SQL_DIAGNOSTICS_GUIDANCE",
+)
+
+
+def __getattr__(name):
+    if name in _COLLECTOR_COMPAT:
+        from . import collector
+        return getattr(collector, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

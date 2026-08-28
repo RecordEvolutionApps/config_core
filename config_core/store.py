@@ -100,14 +100,25 @@ def _error_text(e):
 
 
 class AssetStore:
-    """Reads and writes the assets / datapoints / assetstatus tables for ONE
-    gateway (``gateway_id == device_key``). Never raises: every method
-    returns explicit values plus an error string."""
+    """Reads and writes one entity table (plus its optional datapoints and
+    status side tables) for ONE gateway (``gateway_id == device_key``).
+    Never raises: every method returns explicit values plus an error string.
 
-    def __init__(self, ironflock, device_key, verify_retry_delay=1.0):
+    Table topology lives here, once. The defaults are the collector family's
+    tables; ``register_config_tools`` injects the app's own ``table`` and
+    passes ``datapoints_table=None`` (no datapoint tools) and its
+    ``status_table``. A ``None`` side table disables the corresponding reads
+    and the handler features built on them."""
+
+    def __init__(self, ironflock, device_key, verify_retry_delay=1.0,
+                 table="assets", datapoints_table="datapoints",
+                 status_table="assetstatus"):
         self.ironflock = ironflock
         self.device_key = int(device_key)
         self.verify_retry_delay = verify_retry_delay
+        self.table = table
+        self.datapoints_table = datapoints_table
+        self.status_table = status_table
 
     # ------------------------------------------------------------- notify
 
@@ -145,21 +156,21 @@ class AssetStore:
     async def read_assets(self):
         """(rows, error) -- latest asset rows of this gateway, live AND
         deleted (partitioning is the handlers' job)."""
-        return await self._read_latest("assets", ASSETS_LIMIT)
+        return await self._read_latest(self.table, ASSETS_LIMIT)
 
     async def read_datapoints(self, asset_name):
         """(rows, error) -- latest datapoint rows of one asset (live and
-        deleted)."""
+        deleted). Only called when ``datapoints_table`` is set."""
         return await self._read_latest(
-            "datapoints",
+            self.datapoints_table,
             DATAPOINTS_LIMIT,
             [{"column": "asset_name", "operator": "=", "value": asset_name}],
         )
 
     async def read_statuses(self):
-        """(rows, error) -- latest assetstatus row per asset of this
-        gateway."""
-        return await self._read_latest("assetstatus", ASSETS_LIMIT)
+        """(rows, error) -- latest status row per asset of this gateway.
+        Only called when ``status_table`` is set."""
+        return await self._read_latest(self.status_table, ASSETS_LIMIT)
 
     # ------------------------------------------------------------- writes
 
@@ -209,13 +220,13 @@ class AssetStore:
     async def append_asset(self, payload):
         """(acked, error) -- append one assets row after the invariant
         choke point."""
-        return await self._append("assets", payload, self.check_asset_payload)
+        return await self._append(self.table, payload, self.check_asset_payload)
 
     async def append_datapoint(self, payload):
         """(acked, error) -- append one datapoints row after the strict
         invariant choke point."""
         return await self._append(
-            "datapoints", payload, self.check_datapoint_payload
+            self.datapoints_table, payload, self.check_datapoint_payload
         )
 
     async def _append(self, table, payload, check):

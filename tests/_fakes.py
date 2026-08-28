@@ -22,6 +22,8 @@ IDENTITY_KEYS = {
     "datapoints": ("gateway_id", "asset_name", "datapoint_id"),
     "assetstatus": ("gateway_id", "asset_name"),
     "gateways": ("gateway_name",),
+    # a generic (register_config_tools) table used by the test suite
+    "connections": ("gateway_id", "asset_name"),
 }
 
 

@@ -8,6 +8,8 @@ import asyncio
 import importlib.util
 import json
 import os
+import subprocess
+import sys
 
 import pytest
 
@@ -18,8 +20,15 @@ from config_core import (
     SQL_DIAGNOSTICS_GUIDANCE,
     coerce_rpc_args,
     register_asset_tools,
+    register_config_tools,
 )
-from config_core.handlers import ToolConfig, rpc_handlers
+from config_core.handlers import (
+    CORE_DEFAULTS,
+    ToolConfig,
+    _Entity,
+    _generic_hints,
+    rpc_handlers,
+)
 from config_core.store import AssetStore, now_iso, strip_platform
 
 from _fakes import FakeIronflock
@@ -36,6 +45,20 @@ def make_tools(validate=passthrough, fake=None, **cfg_kwargs):
     fake = fake or FakeIronflock(device_key=DEVICE_KEY)
     store = AssetStore(fake, DEVICE_KEY, verify_retry_delay=0)
     cfg = ToolConfig(validate, **cfg_kwargs)
+    return fake, store, cfg, rpc_handlers(store, cfg)
+
+
+def make_generic_tools(validate=passthrough, fake=None, table="connections",
+                       status_table=None, noun="connection",
+                       create_defaults=None, **cfg_kwargs):
+    """The register_config_tools shape: custom table, no datapoints, no
+    coercion, generic hints."""
+    fake = fake or FakeIronflock(device_key=DEVICE_KEY)
+    store = AssetStore(fake, DEVICE_KEY, verify_retry_delay=0, table=table,
+                       datapoints_table=None, status_table=status_table)
+    entity = _Entity(noun=noun, create_defaults=dict(create_defaults or {}),
+                     coerce=None, hints=_generic_hints(noun))
+    cfg = ToolConfig(validate, entity=entity, **cfg_kwargs)
     return fake, store, cfg, rpc_handlers(store, cfg)
 
 
@@ -209,6 +232,9 @@ async def test_secret_guard():
         {"opc_password": "hunter2"},
         {"host": "opc.tcp://user:hunter2@10.0.0.1:4840"},
         {"note": "-----BEGIN RSA PRIVATE KEY-----"},
+        # Public certificates are refused too, by value, even though the
+        # column name passes -- decided 2026-08-28, see SECRET_VALUE_RES.
+        {"tls_ca": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"},
         {"datapoint_spec": "- name: t\n  address: eyJhbGciOiJIUzI1NiJ9.eyJzdWIifQ"},
     ]
     for fields in cases:
@@ -313,6 +339,37 @@ async def test_validate_returning_bad_core_value_rejected():
         response["problems"]
     )
     assert fake.rows("assets") == []
+
+
+async def test_validate_receives_documented_candidate():
+    """What validate sees is contract (README "What config holds at call
+    time"): a non-collector app rejecting unknown columns rejects every
+    create if the seed grows, so the seed is pinned here too."""
+    seen = []
+
+    def validate(config, existing):
+        seen.append((dict(config), existing))
+        return dict(config), []
+
+    assert CORE_DEFAULTS == {"datapoint_spec": "", "collect_interval": 5,
+                             "enabled": True, "demo_mode": False}
+
+    fake, _, _, handlers = make_tools(validate=validate)
+    check(await handlers["create"](
+        asset_name="Press 1", fields={"host": "10.0.0.5"}))
+    candidate, existing = seen.pop()
+    assert candidate == dict(CORE_DEFAULTS, host="10.0.0.5",
+                             asset_name="Press 1", gateway_id=DEVICE_KEY)
+    assert existing is None
+
+    check(await handlers["update"](
+        asset_name="Press 1", changes={"collect_interval": 30}))
+    candidate, existing = seen.pop()
+    # the stored row minus the platform columns, plus the agent's change
+    assert candidate == dict(CORE_DEFAULTS, host="10.0.0.5",
+                             asset_name="Press 1", gateway_id=DEVICE_KEY,
+                             collect_interval=30, deleted=False)
+    assert existing["tsp"] and existing["authid"] == f"device-{DEVICE_KEY}"
 
 
 async def test_validate_bad_shape_rejected():
@@ -962,6 +1019,198 @@ async def test_registered_handler_end_to_end():
     json.dumps(response)
     assert response["ok"] is True
     assert fake.latest("assets", asset_name="Press 1") is not None
+
+
+# ------------------------------------------------- generic entity (1.2.0)
+
+
+async def test_generic_crud_on_custom_table():
+    fake, _, _, handlers = make_generic_tools(audit_column="configured_by")
+    response = check(await handlers["create"](
+        asset_name="Broker 1", fields={"broker_url": "mqtts://x:8883"}))
+    assert response["ok"] is True and response["created"] is True
+    row = fake.latest("connections", asset_name="Broker 1")
+    assert row["broker_url"] == "mqtts://x:8883"
+    assert row["configured_by"] == "agent"
+
+    response = check(await handlers["update"](
+        asset_name="Broker 1", changes={"broker_url": "mqtts://y:8883"}))
+    assert response["ok"] is True
+    response = check(await handlers["get"](asset_name="Broker 1"))
+    assert response["asset"]["broker_url"] == "mqtts://y:8883"
+    response = check(await handlers["delete"](asset_name="Broker 1"))
+    assert response["ok"] is True
+    assert fake.latest("connections", asset_name="Broker 1")["deleted"] is True
+
+    # every read and write hit ONLY the entity's own table
+    touched = {t for method, t in fake.calls
+               if method in ("getHistory", "append_to_table")}
+    assert touched == {"connections"}
+
+
+async def test_generic_create_seeds_nothing():
+    """The data_relay regression: a validate that hard-rejects unknown
+    columns must accept an empty create, because nothing is seeded."""
+    seen = []
+
+    def strict(config, existing):
+        seen.append((dict(config), existing))
+        unknown = set(config) - {"asset_name", "gateway_id", "broker_url"}
+        if unknown:
+            return None, [f"unknown column(s): {', '.join(sorted(unknown))}"]
+        return dict(config), []
+
+    _, _, _, handlers = make_generic_tools(validate=strict)
+    response = check(await handlers["create"](asset_name="Broker 1",
+                                              fields={}))
+    assert response["ok"] is True, response
+    candidate, existing = seen.pop()
+    assert candidate == {"asset_name": "Broker 1", "gateway_id": DEVICE_KEY}
+    assert existing is None
+
+
+async def test_generic_create_defaults_seed_under_agent_fields():
+    fake, _, _, handlers = make_generic_tools(
+        create_defaults={"enabled": True})
+    check(await handlers["create"](asset_name="Broker 1", fields={}))
+    assert fake.latest("connections", asset_name="Broker 1")["enabled"] is True
+    check(await handlers["create"](asset_name="Broker 2",
+                                   fields={"enabled": False}))
+    assert (fake.latest("connections", asset_name="Broker 2")["enabled"]
+            is False)
+
+
+async def test_generic_status_table_gating():
+    # without: no live_status field, no status read, no warning
+    fake, _, _, handlers = make_generic_tools()
+    check(await handlers["create"](asset_name="Broker 1", fields={}))
+    response = check(await handlers["list"]())
+    assert "live_status" not in response["assets"][0]
+    assert "warnings" not in response
+    response = check(await handlers["get"](asset_name="Broker 1"))
+    assert "live_status" not in response
+    assert ("getHistory", "assetstatus") not in fake.calls
+
+    # with: joined exactly like the collector preset
+    fake, _, _, handlers = make_generic_tools(status_table="assetstatus")
+    check(await handlers["create"](asset_name="Broker 1", fields={}))
+    fake.external_append("assetstatus", {
+        "tsp": now_iso(), "asset_name": "Broker 1",
+        "gateway_id": DEVICE_KEY, "status": "online", "detail": "",
+    })
+    response = check(await handlers["get"](asset_name="Broker 1"))
+    assert response["live_status"]["status"] == "online"
+    response = check(await handlers["list"]())
+    assert response["assets"][0]["live_status"]["status"] == "online"
+
+
+async def test_generic_has_no_datapoint_machinery():
+    fake, _, _, handlers = make_generic_tools()
+    assert set(handlers) == {"list", "get", "create", "update", "delete"}
+    check(await handlers["create"](asset_name="Broker 1", fields={}))
+    response = check(await handlers["get"](asset_name="Broker 1"))
+    assert "datapoints" not in response
+    response = check(await handlers["list"]())
+    assert "datapoint_spec" not in response["assets"][0]
+    response = check(await handlers["delete"](asset_name="Broker 1",
+                                              dry_run=True))
+    assert "datapoints_to_delete" not in response
+    response = check(await handlers["delete"](asset_name="Broker 1"))
+    assert "datapoints_deleted" not in response
+    assert "datapoints_failed" not in response
+    assert ("getHistory", "datapoints") not in fake.calls
+
+
+async def test_generic_no_coercion_reaches_validate():
+    """No collector column hygiene: a string boolean reaches validate as-is
+    -- the app owns typing (documented in register_config_tools)."""
+    seen = []
+
+    def recording(config, existing):
+        seen.append(dict(config))
+        return dict(config), []
+
+    _, _, _, handlers = make_generic_tools(validate=recording)
+    check(await handlers["create"](asset_name="Broker 1",
+                                   fields={"enabled": "false",
+                                           "collect_interval": "2.5"}))
+    candidate = seen.pop()
+    assert candidate["enabled"] == "false"
+    assert candidate["collect_interval"] == "2.5"
+
+
+async def test_generic_noun_in_prose():
+    fake, _, _, handlers = make_generic_tools()
+    response = check(await handlers["get"](asset_name="Nope 1"))
+    assert "No connection named" in response["hint"]
+    assert response["problems"] == ["connection 'Nope 1' not found"]
+    check(await handlers["create"](asset_name="Broker 1", fields={}))
+    assert any("created connection 'Broker 1'" in (r["user_message"] or "")
+               for r in fake.reported)
+
+
+async def test_register_config_tools_end_to_end(monkeypatch):
+    fake = FakeIronflock(device_key=DEVICE_KEY)
+    failed = await register_config_tools(
+        fake, passthrough, "connections", noun="connection",
+        create_defaults={"enabled": True}, device_key=DEVICE_KEY,
+    )
+    assert failed == []
+    # exactly the five CRUD topics, shared with the preset's wire contract
+    expected = {DEFAULT_TOPICS[op]
+                for op in ("list", "get", "create", "update", "delete")}
+    assert set(fake.registered) == expected
+
+    create = fake.registered[DEFAULT_TOPICS["create"]]
+    response = await create({"asset_name": "Broker 1",
+                             "fields": {"broker_url": "mqtts://x:8883"}})
+    json.dumps(response)
+    assert response["ok"] is True
+    row = fake.latest("connections", asset_name="Broker 1")
+    assert row["enabled"] is True and row["broker_url"] == "mqtts://x:8883"
+
+    # partial topics + None skip
+    fake = FakeIronflock(device_key=DEVICE_KEY)
+    failed = await register_config_tools(
+        fake, passthrough, "connections", device_key=DEVICE_KEY,
+        topics={"delete": None, "list": "custom.list"},
+    )
+    assert failed == []
+    assert "custom.list" in fake.registered
+    assert DEFAULT_TOPICS["delete"] not in fake.registered
+    assert DEFAULT_TOPICS["list_datapoints"] not in fake.registered
+
+    # failure paths mirror register_asset_tools
+    monkeypatch.delenv("DEVICE_KEY", raising=False)
+    fake = FakeIronflock(device_key=DEVICE_KEY)
+    failed = await register_config_tools(fake, passthrough, "connections")
+    assert set(failed) == expected
+    assert any(r["level"] == "warn" for r in fake.reported)
+    fake = FakeIronflock(device_key=DEVICE_KEY)
+    failed = await register_config_tools(fake, "not-callable", "connections",
+                                         device_key=DEVICE_KEY)
+    assert set(failed) == expected
+    assert fake.registered == {}
+
+
+def test_collector_import_paths_survive():
+    """Consuming apps pin config_core.handlers.* names in drift tests; both
+    import orders must work on a fresh interpreter (the handlers->collector
+    re-export is lazy)."""
+    for script in (
+        "from config_core.handlers import CORE_DEFAULTS, "
+        "USER_DATAPOINT_COLUMNS, DATAPOINT_COERCERS, "
+        "RECOMMENDED_PROMPT_GUIDANCE; "
+        "assert CORE_DEFAULTS['collect_interval'] == 5",
+        "import config_core.collector; "
+        "import config_core.handlers as h; "
+        "assert h.CORE_DEFAULTS is config_core.collector.CORE_DEFAULTS",
+    ):
+        subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
 
 
 # ------------------------------------------------------------------- misc
