@@ -8,7 +8,7 @@ assetstatus); ``register_config_tools`` manages any named-row config table.
 See README.md for the full contract.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 from .collector import (
     RECOMMENDED_PROMPT_GUIDANCE,
