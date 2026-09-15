@@ -5,6 +5,7 @@ part of the contract (responses travel over WAMP to the agent runtime).
 """
 
 import asyncio
+from datetime import datetime
 import importlib.util
 import json
 import os
@@ -581,10 +582,74 @@ async def test_update_superseded_detected():
     assert "user-9" in response["hint"]
 
 
+def _as_fleetdb_returns_it(table, row):
+    """fleetdb's history path parses timestamptz into epoch MILLISECONDS
+    (DatabaseManager.ts, type parser 1184), so the row read back never
+    carries the ISO string this library stamped."""
+    moment = datetime.fromisoformat(str(row["tsp"]).replace("Z", "+00:00"))
+    row["tsp"] = int(moment.timestamp() * 1000)
+
+
+async def test_update_verified_when_the_backend_returns_epoch_ms():
+    """Every write against the real platform reported "unverified" - the
+    read-back tsp was a number, which did not parse, and a millisecond
+    reading of our microsecond stamp would have looked older anyway."""
+    fake, _, _, handlers = make_tools()
+    seed_asset(fake, "Press 1")
+    fake.on_append(_as_fleetdb_returns_it)
+    response = check(await handlers["update"](
+        asset_name="Press 1", changes={"collect_interval": 30}))
+    assert response["ok"] is True
+    assert response["status"] == "applied"
+    assert response["verified"] is True
+
+
+async def test_create_verified_when_the_backend_returns_epoch_ms():
+    fake, _, _, handlers = make_tools()
+    fake.on_append(_as_fleetdb_returns_it)
+    response = check(await handlers["create"](
+        asset_name="Press 2", fields={"host": "10.0.0.2"}))
+    assert response["ok"] is True
+    assert response["verified"] is True
+
+
+async def test_update_superseded_detected_with_epoch_ms():
+    fake, _, _, handlers = make_tools()
+    seed_asset(fake, "Press 1")
+
+    def racing_writer(table, row):
+        if table == "assets":
+            fake.on_append(None)  # once
+            _as_fleetdb_returns_it(table, row)
+            newer = dict(row)
+            newer["collect_interval"] = 99
+            newer["tsp"] = row["tsp"] + 5
+            fake.external_append("assets", newer, authid="user-9")
+
+    fake.on_append(racing_writer)
+    response = check(await handlers["update"](
+        asset_name="Press 1", changes={"collect_interval": 30}))
+    assert response["verified"] is False
+    assert response["superseded"] is True
+
+
+def test_parse_tsp_reads_both_forms_the_platform_uses():
+    from config_core.store import parse_tsp
+
+    iso = parse_tsp("2026-09-15T09:57:43.899Z")
+    assert iso == parse_tsp(1789466263899)
+    assert parse_tsp(None) is None and parse_tsp("") is None
+    assert parse_tsp(True) is None and parse_tsp("not a date") is None
+
+
 async def test_update_visibility_lag_unverified():
     fake = FakeIronflock(device_key=DEVICE_KEY, defer_visibility=True)
     fake, _, _, handlers = make_tools(fake=fake)
-    seed_asset(fake, "Press 1")
+    # Seeded well in the past: the write is judged at the platform's
+    # MILLISECOND precision, so a seed stamped in the same millisecond as the
+    # update is indistinguishable from it - as it would be on fleetdb - and
+    # this test would be measuring the clock instead of the lag.
+    seed_asset(fake, "Press 1", tsp="2020-01-01T00:00:00+00:00")
     response = check(await handlers["update"](
         asset_name="Press 1", changes={"collect_interval": 30}))
     assert response["ok"] is True

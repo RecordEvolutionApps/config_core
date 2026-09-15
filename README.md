@@ -117,6 +117,39 @@ Everything else in this README — the validate contract, response envelope,
 write semantics, secret scan, concurrency — applies to both entry points;
 collector-only behavior is marked as such.
 
+## Form save feedback (`SubmitFeedback`)
+
+A board's `widget-form` publishes its row and closes: the user never hears
+whether the app can use what they saved. `SubmitFeedback` answers from the app,
+which is the only party that knows, with one `error-logs` row per save that a
+board's `widget-toast` pops up.
+
+```python
+from config_core import SubmitFeedback
+
+feedback = SubmitFeedback(ironflock, check_row, noun="connection")
+
+# in the table subscription handler, once the row has been checked/applied:
+await feedback.acknowledge(row)               # or acknowledge(row, error=exc)
+```
+
+- **Only a person's save is answered.** A row whose `authid` is digits only
+  came from a browser session (an account key); app containers authenticate
+  as `app-<n>-<stage>-e<k>@<serial>` or the device serial. The assistant's
+  writes and the app's own echoes therefore stay silent.
+- **Once per row**, keyed on `asset_name` + `tsp`.
+- **`check(row)` is not the tools' validate function.** It returns the
+  problems that stop the row from running (sync or async). A form may write
+  what the assistant may not - a password - so the tools' secret and
+  unknown-column refusals do not belong in it.
+- **Severities are `success` and `error`**, the toast widget's vocabulary
+  (it renders unknown values as `info`). A delete is acknowledged without a
+  check. `report(message, user_message, level, name)` replaces the default
+  `ironflock.report_error`, e.g. to route through an app's rate-limited
+  reporter keyed on the entity name. It never raises.
+- **Call it from the live subscription only**, never while loading rows at
+  startup - every form-created row carries a person's authid.
+
 ## The validate function (the app contract)
 
 ```python

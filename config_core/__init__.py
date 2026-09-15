@@ -23,6 +23,10 @@ from .register import (
     register_asset_tools,
     register_config_tools,
 )
+from .submit import (
+    SubmitFeedback,
+    submitted_by_person,
+)
 
 __all__ = [
     "__version__",
@@ -33,4 +37,6 @@ __all__ = [
     "coerce_rpc_args",
     "register_asset_tools",
     "register_config_tools",
+    "SubmitFeedback",
+    "submitted_by_person",
 ]

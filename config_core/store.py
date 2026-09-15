@@ -87,10 +87,21 @@ def normalized_diff(candidate, existing, ignore=("tsp",)):
 
 
 def parse_tsp(value):
-    """Parse an ISO tsp into an aware datetime, or None when unparsable.
-    Tolerates the trailing-Z form (Python 3.10 fromisoformat does not)."""
-    if not value:
+    """Parse a tsp into an aware datetime, or None when unparsable.
+
+    Two forms, because a row's tsp comes back in a different one than it was
+    written in: this library stamps an ISO string, and fleetdb's history read
+    path turns every timestamptz into EPOCH MILLISECONDS (a number). Accepting
+    only ISO made every read-back "not comparable", so every write reported
+    "unverified" while it had landed. Tolerates the trailing-Z form (Python
+    3.10 fromisoformat does not)."""
+    if value is None or value == "" or isinstance(value, bool):
         return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
@@ -326,13 +337,22 @@ def _find_by_name(rows, asset_name):
     return None
 
 
+def _to_millisecond(moment):
+    return moment.replace(microsecond=moment.microsecond // 1000 * 1000)
+
+
 def _judge(row, written_tsp):
-    """Compare the latest row's tsp against the tsp we stamped."""
+    """Compare the latest row's tsp against the tsp we stamped.
+
+    At MILLISECOND precision: `now_iso` stamps microseconds and fleetdb reads
+    back milliseconds, so an exact comparison sees our own row as slightly
+    OLDER than our write, forever."""
     if row is None:
         return "pending", "no row visible for the asset yet"
     ours, theirs = parse_tsp(written_tsp), parse_tsp(row.get("tsp"))
     if ours is None or theirs is None:
         return "pending", "row tsp not comparable"
+    ours, theirs = _to_millisecond(ours), _to_millisecond(theirs)
     if theirs == ours:
         return "verified", None
     if theirs > ours:
