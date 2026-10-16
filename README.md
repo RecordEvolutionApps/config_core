@@ -560,8 +560,9 @@ enabled: the table schema (`error-logs` with the `msg LIKE 'AssetName: %'`
 prefix convention, `measurements.data` keyed by datapoint id,
 `assetstatus`), the latest/deleted filtering rule on config tables, the
 change_detection / demo_mode / store_data caveats and canned example
-queries. Compress both texts as needed to fit your agent's 5000-char
-system-prompt budget — the constants are the uncompressed reference.
+queries. Compress both texts as needed to fit your agent's system-prompt
+budget (the ai-template caps it at 25000 chars, and a shorter prompt is
+cheaper on every turn) — the constants are the uncompressed reference.
 
 ## Testing your integration
 
