@@ -309,7 +309,10 @@ steering text for the agent and are NOT part of the semver contract.
 - **Idempotence.** Every applied asset write restarts that asset's
   collection task, so writes that change nothing are skipped
   (`no_change`, numeric/boolean-normalized comparison) — re-applying a
-  config is free.
+  config is free. Only the configuration counts: the protected columns the
+  tools re-stamp (`deleted` null vs false, the audit column "board" vs
+  "agent") are not a change, so an agent re-applying a board-saved asset
+  writes nothing.
 - **Live pickup.** The running collector subscribes to the assets table:
   a write reconfigures the asset immediately, and the adapter's
   `prepare_datapoints` regenerates the datapoints catalog from the asset
@@ -346,9 +349,11 @@ steering text for the agent and are NOT part of the semver contract.
   secret scan below rejects secret-looking columns).
 - **Concurrency.** Mutations are serialized per instance with a lock;
   concurrent board/discovery writers are handled by optional `expected_tsp`
-  (compare-and-set against the tsp from `get`) and by `superseded`
-  detection on the read-back. Editing an `auto_registered` asset warns that
-  the network scanner may rewrite identity fields.
+  (compare-and-set against the tsp from `get`, matched at millisecond
+  precision in any form: epoch ms as a number or text, or ISO) and by
+  `superseded` detection on the read-back. Editing an `auto_registered`
+  asset only notes that network discovery created it: a gateway adds
+  discovered rows and never changes them.
 - **Secrets never go into tables.** Column names matching
   password/token/key/certificate patterns and values containing PEM blocks,
   URL-embedded credentials or JWTs are rejected — use the platform secret
@@ -668,6 +673,11 @@ Contract changes an app or prompt may notice:
 - `get`'s `datapoints.disabled` / `change_detection` count effective
   settings.
 - Set `secret: true` values show as `"(set)"` in every response.
+- An update whose only differences are the re-stamped protected columns
+  (`deleted`, the audit column) is `no_change`; `changed_fields` never lists
+  them.
+- `SQL_DIAGNOSTICS_GUIDANCE` now says how to pick the current rows in SQL
+  (newest per key first, then `deleted IS NOT TRUE`); re-paste it.
 - `AssetStore` (internal) lost `append_datapoint`,
   `check_datapoint_payload` and `cascade_delete_datapoints`, and gained
   `read_settings`, `append_setting`, `check_setting_payload`,

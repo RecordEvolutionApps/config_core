@@ -26,6 +26,8 @@ import asyncio
 import re
 from collections import OrderedDict
 
+from .store import parse_tsp
+
 #: A browser session's authid: fleetdb resolves it as a bigint account key.
 PERSON_AUTHID_RE = re.compile(r"^[0-9]+$")
 
@@ -83,7 +85,11 @@ class SubmitFeedback:
         name = str(row.get("asset_name") or "").strip()
         if not name:
             return None
-        key = (name, str(row.get("tsp")))
+        # The same save read once (epoch ms) and delivered once (ISO text)
+        # is one row: key on the moment, not on its spelling.
+        moment = parse_tsp(row.get("tsp"))
+        key = (name, moment.isoformat(timespec="milliseconds")
+               if moment is not None else str(row.get("tsp")))
         if key in self._seen:
             return None
         self._seen[key] = True

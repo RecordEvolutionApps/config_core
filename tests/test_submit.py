@@ -130,3 +130,11 @@ async def test_the_memory_is_bounded():
     for second in range(3):
         await fb.acknowledge(row(tsp=f"2026-09-15T10:00:0{second}.000Z"))
     assert len(fb._seen) == 2
+
+
+async def test_the_same_save_read_and_delivered_is_answered_once():
+    # A history read gives the tsp as epoch ms, the table event as ISO text.
+    fake, fb = feedback()
+    assert await fb.acknowledge(row()) == "success"
+    millis = 1789466400000  # 2026-09-15T10:00:00.000Z
+    assert await fb.acknowledge(row(tsp=millis)) is None

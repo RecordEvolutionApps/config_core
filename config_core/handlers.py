@@ -27,10 +27,12 @@ from .store import (
     PLATFORM_COLUMNS,
     RUNTIME_KEYS,
     SECRET_DISPLAY,
+    _to_millisecond,
     is_secret_placeholder,
     mask_secrets,
     normalized_diff,
     now_iso,
+    parse_tsp,
     strip_platform,
 )
 
@@ -495,17 +497,40 @@ def _restamp(config, asset_name, device_key, audit, deleted=False):
     return row
 
 
-def _diff_payload(row, changed_fields):
+def _diff_payload(row, changed_fields, audit_column=None):
     """The wire payload for an update: ONLY the changed columns plus the
-    protected ones. The platform's carry-over merge (fleetdb entity tables)
-    fills the rest from the previous latest row, so untouched columns can
-    no longer clobber a concurrent writer's values. A column the validate
-    function dropped shows up in the diff with value None -- written as an
-    explicit null, which blanks it."""
+    protected ones (and the audit stamp). The platform's carry-over merge
+    (fleetdb entity tables) fills the rest from the previous latest row, so
+    untouched columns can no longer clobber a concurrent writer's values. A
+    column the validate function dropped shows up in the diff with value
+    None -- written as an explicit null, which blanks it."""
     payload = {column: row.get(column) for column in changed_fields}
     for column in ("asset_name", "gateway_id", "deleted", "tsp"):
         payload[column] = row[column]
+    if audit_column and audit_column in row:
+        payload[audit_column] = row[audit_column]
     return payload
+
+
+def _same_tsp(expected, current):
+    """Whether an agent's ``expected_tsp`` names the row's current tsp. The
+    read returns epoch milliseconds, which an agent may send back as an int,
+    a float or text, or as the ISO form; compared at millisecond precision,
+    and as text when either side does not parse."""
+    ours, theirs = parse_tsp(_number_or_text(expected)), parse_tsp(current)
+    if ours is None or theirs is None:
+        return str(expected) == str(current)
+    return _to_millisecond(ours) == _to_millisecond(theirs)
+
+
+def _number_or_text(value):
+    """A numeric string as a number (an epoch-ms tsp sent back as text)."""
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return value
+    return value
 
 
 def _row_size_problem(row):
@@ -843,7 +868,7 @@ async def update_asset(store, cfg, asset_name, changes=None,
             "configuration.",
             previous=strip_platform(existing),
         )
-    if expected_tsp is not None and str(expected_tsp) != str(existing.get("tsp")):
+    if expected_tsp is not None and not _same_tsp(expected_tsp, existing.get("tsp")):
         return {
             "ok": False,
             "status": "conflict",
@@ -864,8 +889,9 @@ async def update_asset(store, cfg, asset_name, changes=None,
     warnings = []
     if existing.get("auto_registered"):
         warnings.append(
-            f"this {noun} is maintained by network discovery - the scanner "
-            "may re-write identity fields"
+            f"this {noun} was created by network discovery - the gateway "
+            "only adds discovered rows and never changes them, so your "
+            "change stays"
         )
     clean, problems, ignored = _partition_fields(changes, name, store.device_key)
     if problems:
@@ -924,7 +950,14 @@ async def update_asset(store, cfg, asset_name, changes=None,
         return _rejected("limit_exceeded", [size_problem],
                          "Reduce the configuration size.")
 
-    changed_fields = normalized_diff(row, existing)
+    # Only the configuration counts as a change: the protected columns are
+    # re-stamped on every write and differ from a board-written row without
+    # changing anything (``deleted`` null vs false, the audit column "board"
+    # vs "agent"). A no-op must not write: a write restarts the asset.
+    ignore = ("tsp", "asset_name", "gateway_id", "deleted")
+    if cfg.audit_column:
+        ignore += (cfg.audit_column,)
+    changed_fields = normalized_diff(row, existing, ignore=ignore)
     if not changed_fields:
         return _finish(
             _ok(
@@ -950,7 +983,7 @@ async def update_asset(store, cfg, asset_name, changes=None,
         )
 
     acked, append_err = await store.append_asset(
-        _diff_payload(row, changed_fields)
+        _diff_payload(row, changed_fields, cfg.audit_column)
     )
     if not acked:
         await store.notify(
@@ -1034,7 +1067,7 @@ async def delete_asset(store, cfg, asset_name, expected_tsp=None,
             changed=False,
         )
 
-    if expected_tsp is not None and str(expected_tsp) != str(existing.get("tsp")):
+    if expected_tsp is not None and not _same_tsp(expected_tsp, existing.get("tsp")):
         return {
             "ok": False,
             "status": "conflict",

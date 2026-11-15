@@ -30,7 +30,7 @@ from config_core.handlers import (
     _generic_hints,
     rpc_handlers,
 )
-from config_core.store import AssetStore, now_iso, strip_platform
+from config_core.store import AssetStore, now_iso, parse_tsp, strip_platform
 
 from _fakes import FakeIronflock
 
@@ -1684,3 +1684,56 @@ async def test_strip_platform():
     row = {"asset_name": "A", "tsp": "t", "latest_flag": True,
            "authid": "u", "device_key": 1, "datapoint_list": [], "host": "h"}
     assert strip_platform(row) == {"asset_name": "A", "host": "h"}
+
+
+# ------------------------------------------------ review fixes (2.0.0)
+
+
+async def test_update_no_op_on_a_board_row_writes_nothing():
+    # A board form writes configured_by "board" and may leave deleted null:
+    # neither makes an otherwise identical update a change.
+    fake, _, _, handlers = make_tools(audit_column="configured_by")
+    seed_asset(fake, "Press 1", deleted=None, configured_by="board",
+               collect_interval=30)
+    before = len(fake.rows("assets"))
+    response = check(await handlers["update"](
+        asset_name="Press 1", changes={"collect_interval": 30}))
+    assert response["status"] == "no_change"
+    assert len(fake.rows("assets")) == before
+
+
+async def test_a_real_update_still_stamps_the_audit_column():
+    fake, _, _, handlers = make_tools(audit_column="configured_by")
+    seed_asset(fake, "Press 1", configured_by="board", collect_interval=30)
+    response = check(await handlers["update"](
+        asset_name="Press 1", changes={"collect_interval": 60}))
+    assert response["status"] == "applied"
+    assert set(response["changed_fields"]) == {"collect_interval"}
+    _, payload = fake.payloads[-1]
+    assert payload["configured_by"] == "agent"
+
+
+async def test_expected_tsp_matches_in_any_spelling():
+    fake, _, _, handlers = make_tools()
+    seed_asset(fake, "Press 1", collect_interval=30)
+    stored = fake.latest("assets", asset_name="Press 1")["tsp"]
+    moment = parse_tsp(stored)
+    millis = int(moment.timestamp() * 1000)
+    for spelling in (millis, float(millis), str(millis),
+                     moment.isoformat(timespec="milliseconds")):
+        response = check(await handlers["update"](
+            asset_name="Press 1", changes={"collect_interval": 30},
+            expected_tsp=spelling))
+        assert response["status"] == "no_change", spelling
+    response = check(await handlers["update"](
+        asset_name="Press 1", changes={"collect_interval": 31},
+        expected_tsp=millis - 5000))
+    assert response["status"] == "conflict"
+
+
+def test_sql_guidance_picks_the_newest_row_before_the_deleted_filter():
+    from config_core import SQL_DIAGNOSTICS_GUIDANCE as guidance
+
+    assert "deleted IS NOT TRUE" in guidance
+    assert "DISTINCT ON" in guidance
+    assert "deleted = false" not in guidance

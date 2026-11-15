@@ -71,14 +71,18 @@ def mask_secrets(value):
         return [mask_secrets(v) for v in value]
     return value
 
-ASSETS_LIMIT = 1000      # matches collector_core's own assets query window
-DATAPOINTS_LIMIT = 3000  # matches collector_core's datapoints query window
-SETTINGS_LIMIT = 3000    # one settings row per datapoint at most
+# Read windows. One gateway's assets (max_assets caps creations at 200 by
+# default) and one asset's catalog and settings rows; collector_core reads up
+# to 10000 rows per table for the whole gateway.
+ASSETS_LIMIT = 1000
+DATAPOINTS_LIMIT = 3000
+SETTINGS_LIMIT = 3000
 
 # The columns a datapoint_settings row may carry besides the optional audit
 # column: the identity, tsp and the user-owned settings. Mirrors
 # collector.USER_DATAPOINT_COLUMNS (kept literal here: the store imports
-# nothing from the handler layer). The table has no ``deleted`` column.
+# nothing from the handler layer), which mirrors collector_core's
+# DATAPOINT_SETTINGS_COLUMNS. The table has no ``deleted`` column.
 SETTINGS_IDENTITY = ("gateway_id", "asset_name", "datapoint_id")
 SETTINGS_VALUE_COLUMNS = (
     "enabled", "change_detection", "demo_value", "demo_variance",
@@ -262,8 +266,8 @@ class AssetStore:
 
     def check_asset_payload(self, payload):
         """Poison-row invariants for an assets append; returns a problem
-        string or None. A malformed asset row is soft-deleted-and-warned at
-        the gateway's next startup -- never write one."""
+        string or None. The gateway skips a malformed asset row and reports
+        it until a user fixes or deletes it -- never write one."""
         problems = self._check_common(payload)
         if problems:
             return problems

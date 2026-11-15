@@ -49,8 +49,9 @@ CORE_DEFAULTS = {
 BOOL_COLUMNS = ("enabled", "demo_mode")
 
 # The datapoint settings a user/agent owns -- the value columns of
-# datapoint_settings (collector_core USER_DATAPOINT_COLUMNS -- kept identical,
-# order included, by a drift test in each consuming app). Everything else
+# datapoint_settings (collector_core DATAPOINT_SETTINGS_COLUMNS -- kept
+# identical, order included, by a drift test in each consuming app; the name
+# here stays for the apps' existing imports). Everything else
 # about a datapoint is the gateway's catalog. The two switches gate what is
 # collected and stored; the two demo settings shape what demo mode produces
 # for the datapoint (the catalog may carry spec-derived demo defaults).
@@ -80,15 +81,18 @@ SQL_DIAGNOSTICS_GUIDANCE = (
     "check for nulls and implausible magnitudes; those usually mean a wrong "
     "address, data_type, scale or byte order in the datapoint spec.\n"
     "- assetstatus (tsp, asset_name, status, detail): status history.\n"
-    "- assets (asset configuration) and datapoints (the catalog the gateway "
+    "- assets (asset configuration), datapoints (the catalog the gateway "
     "derives from each asset: datapoint_id, name, units, path, default "
-    "demo_value/demo_variance) hold history: always add the latest filter "
-    "and deleted = false.\n"
-    "- datapoint_settings (gateway_id, asset_name, datapoint_id, enabled, "
-    "change_detection, demo_value, demo_variance, configured_by): the "
-    "user's per-datapoint switches, latest filter, no deleted column. A "
+    "demo_value/demo_variance) and datapoint_settings (enabled, "
+    "change_detection, demo_value, demo_variance, configured_by: the user's "
+    "per-datapoint switches) keep every version of a row. Take the newest "
+    "row per key FIRST (DISTINCT ON the key ORDER BY tsp DESC), and only "
+    "then drop deleted ones with deleted IS NOT TRUE (board rows may leave "
+    "deleted null; filtering before picking the newest brings back an older "
+    "version of a deleted row). datapoint_settings has no deleted column; a "
     "missing row or a null column means the default: enabled, every value "
-    "stored, the catalog's demo values. Prefer list_datapoints, which "
+    "stored, the catalog's demo values. Every table holds all gateways' "
+    "rows: filter gateway_id for one gateway. Prefer list_datapoints, which "
     "merges catalog and settings; prefer the asset tools for config reads.\n"
     "Caveats: change_detection datapoints only appear when their value "
     "changes; demo_mode values are synthetic; a gateway with store_data = "
@@ -96,6 +100,10 @@ SQL_DIAGNOSTICS_GUIDANCE = (
     "Example - last errors for one asset:\n"
     "  SELECT tsp, level, msg FROM \"error-logs\" "
     "WHERE msg LIKE 'Press 1: %' ORDER BY tsp DESC LIMIT 20\n"
+    "Example - the current, undeleted assets of gateway 42:\n"
+    "  SELECT * FROM (SELECT DISTINCT ON (asset_name) * FROM assets "
+    "WHERE gateway_id = 42 ORDER BY asset_name, tsp DESC) a "
+    "WHERE deleted IS NOT TRUE\n"
     "Example - latest data batches:\n"
     "  SELECT tsp, data FROM measurements "
     "WHERE asset_name = 'Press 1' ORDER BY tsp DESC LIMIT 5"
