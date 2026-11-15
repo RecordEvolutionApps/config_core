@@ -7,9 +7,11 @@ config rows on the gateway the agent targets.
 Two entry points, one wire contract:
 
 - **`register_asset_tools`** — the collector preset (MTConnect, Modbus,
-  BACnet, IO-Link, PLC, …): manages the `assets` / `datapoints` /
-  `assetstatus` tables, seeds and coerces the collector_core contract
-  columns, and adds the per-datapoint switch tools.
+  BACnet, IO-Link, PLC, …, on collector_core v3): manages the `assets`
+  table, reads the gateway's `datapoints` catalog and `assetstatus`, writes
+  the per-datapoint `datapoint_settings`, seeds and coerces the
+  collector_core contract columns, and adds the per-datapoint settings
+  tools.
 - **`register_config_tools`** — the generic form for any other app: manages
   ONE named-row config table of the app's choosing, seeds nothing the app
   did not declare, and has no datapoint tools.
@@ -46,7 +48,7 @@ the agent in the app's ai-template so it inspects `error-logs`,
 
 ```
 ironflock>=1.6.0
-ironflock-config-core @ git+https://github.com/RecordEvolutionApps/config_core.git@v1.0.0
+ironflock-config-core @ git+https://github.com/RecordEvolutionApps/config_core.git@v2.0.0
 ```
 
 In the app's `ProtocolAdapter.start_background(collector)` — the seam where
@@ -67,13 +69,30 @@ else:
 ```
 
 `register_asset_tools(ironflock, validate, topics=DEFAULT_TOPICS,
-name_pattern=..., audit_column=None, max_assets=200, device_key=None)`
-returns the list of topics that FAILED to register (empty = success) and
-never raises. Optional knobs: `topics` may be a partial dict (an operation
-mapped to `None` is skipped, e.g. no delete tool), `audit_column` (e.g.
-`"configured_by"`) is stamped `"agent"` on every write when the app's
-data-template declares that column, `max_assets` caps creations per gateway,
-`device_key` defaults to the platform-injected `DEVICE_KEY` env var.
+name_pattern=..., audit_column=None, max_assets=200, device_key=None,
+settings_table="datapoint_settings")` returns the list of topics that
+FAILED to register (empty = success) and never raises. Optional knobs:
+`topics` may be a partial dict (an operation mapped to `None` is skipped,
+e.g. no delete tool), `audit_column` (e.g. `"configured_by"`) is stamped
+`"agent"` on every write — `assets` rows and `datapoint_settings` rows —
+when the app's data-template declares that column, `max_assets` caps
+creations per gateway, `device_key` defaults to the platform-injected
+`DEVICE_KEY` env var, `settings_table` names the per-datapoint settings
+table (`None` drops the `set_datapoints` tool).
+
+### Tables of the collector preset (one writer per table)
+
+| Table | Writer | What the tools do with it |
+|---|---|---|
+| `assets` | the board and these tools | read, create, update, soft delete |
+| `datapoints` | the gateway only (the catalog: `datapoint_id`, `name`, `units`, `path`, default `demo_value`/`demo_variance`, protocol columns) | read only — never written; on an asset delete the gateway soft-deletes the asset's catalog rows itself |
+| `datapoint_settings` | the board and these tools (`maintainLatestFlagFor` `[gateway_id, asset_name, datapoint_id]`; columns `tsp`, `gateway_id`, `asset_name`, `datapoint_id`, `enabled`, `change_detection`, `demo_value`, `demo_variance`, `configured_by`) | read, partial rows written by `set_datapoints` |
+| `assetstatus` | the gateway | read (`live_status`) |
+
+The gateways table is not read. A datapoint's **effective** setting is its
+non-null `datapoint_settings` value, else the catalog's value (the demo
+pair), else the built-in default (`enabled` true, `change_detection`
+false).
 
 **Gateway scoping is automatic.** The RPC URIs are device-scoped
 (`{swarm}.{device_key}.{app}.{env}.{topic}`), so the agent targets one
@@ -109,8 +128,8 @@ raises) and the same wire contract: default topics
   `collect_interval`/`datapoint_spec` hygiene does not run; a string
   `"false"` for a boolean column reaches your validate as-is. Coerce there.
 - **No datapoint tools**, no datapoint summary in `get`, no
-  `datapoints_deleted`/`datapoints_failed` fields on `delete`, no
-  `datapoint_spec` preview in `list`.
+  `datapoints_to_delete` on a `delete` dry run, no `datapoint_spec`
+  preview in `list`.
 - **`status_table=None`** also drops `live_status` from `list`/`get`.
 
 Everything else in this README — the validate contract, response envelope,
@@ -166,6 +185,11 @@ async def validate_my_asset(config, existing):   # sync also accepted
     """
 ```
 
+On update, a set `secret: true` column arrives as the platform's
+placeholder string `"__secret__"` (that is what reads return); return it
+as-is or drop it — either way the stored secret is kept (see *Secret
+columns* below).
+
 Return the valid — possibly normalized, defaults filled — config with an
 empty problems list, or any problems as a list of strings (return all of
 them at once so the agent fixes everything in one round). Raising also
@@ -207,9 +231,9 @@ is "missing `enabled` means OFF" simply leaves it out of its defaults.)
 | `get`            | `app_assets.get`       | one asset: full config, live status, datapoint summary |
 | `create`         | `app_assets.create`    | new asset (collection starts immediately) |
 | `update`         | `app_assets.update`    | partial update via echo-merge |
-| `delete`         | `app_assets.delete`    | soft delete, cascades to datapoint rows |
-| `list_datapoints`| `app_datapoints.list`  | *(preset only)* the live datapoint catalog of one asset |
-| `set_datapoints` | `app_datapoints.set`   | *(preset only)* per-datapoint `enabled` / `change_detection` switches + `demo_value` / `demo_variance` |
+| `delete`         | `app_assets.delete`    | soft delete (the gateway then removes the asset's datapoint catalog) |
+| `list_datapoints`| `app_datapoints.list`  | *(preset only)* the live datapoint catalog of one asset with the effective settings |
+| `set_datapoints` | `app_datapoints.set`   | *(preset only)* writes `enabled` / `change_detection` / `demo_value` / `demo_variance` to `datapoint_settings` |
 
 All apps share these topic names — the platform scopes the URIs per device.
 `register_config_tools` registers only the five `app_assets.*` operations.
@@ -239,17 +263,26 @@ Notable per-tool fields:
 - **get** — `asset` (full row, spec capped at 32 KB in the response),
   `_meta` `{tsp, last_changed_by, auto_registered?, <audit_column>?}`;
   `live_status` when a status table is configured; preset adds the
-  `datapoints` summary `{count, disabled, change_detection, ids}`.
+  `datapoints` summary `{count, disabled, change_detection, ids}` (counts
+  of the EFFECTIVE settings).
   Unknown names return difflib `suggestions` plus the `available` names.
 - **create / update** — `applied` (the written row) or `would_write`
   (dry_run), `changed_fields` `{col: {from, to}}`, `previous` (pre-write row
   → one-call undo), `verified` (read-back confirmed our row is latest);
   `superseded: true` + `current` when a concurrent writer landed after us
   (`ok` stays true — our row is in the append-only history).
-- **delete** — `previous`; preset adds `datapoints_deleted`,
-  `datapoints_failed` (call again to finish a partial cascade).
-- **set_datapoints** *(preset)* — per-item `results`,
-  `applied`/`no_change`/`rejected`/`failed` counts.
+- **delete** — `previous`, `verified`; a preset dry run adds
+  `datapoints_to_delete` (the catalog entries the gateway will remove).
+- **list_datapoints** *(preset)* — `count`, `datapoints`: each live catalog
+  row (platform columns stripped) with `enabled`, `change_detection`,
+  `demo_value`, `demo_variance` replaced by their effective values, plus
+  `user_set` (the columns that come from the user's setting; omitted when
+  none do).
+- **set_datapoints** *(preset)* — per-item `results` (`status`
+  applied/no_change/dry_run/rejected/failed; `applied` or `would_write`
+  holds the changed columns only; applied items carry `verified`, and
+  `superseded: true` + `current` + `detail` when a newer settings write
+  landed after ours), `applied`/`no_change`/`rejected`/`failed` counts.
 
 Failure classes: `rejected` (your input; fix and retry), `conflict`
 (`expected_tsp` mismatch; re-read), `failed` (`link_error` /
@@ -281,16 +314,36 @@ steering text for the agent and are NOT part of the semver contract.
   a write reconfigures the asset immediately, and the adapter's
   `prepare_datapoints` regenerates the datapoints catalog from the asset
   config. No restart, no extra plumbing, **no app-side extraction function**.
-- **Datapoints.** Only `enabled`, `change_detection`, `demo_value` and
-  `demo_variance` are user-owned (preserved across rediscovery); everything
-  else is machine-written and `set_datapoints` rejects it. All four apply on
-  the next publish cycle WITHOUT restarting the connection. The demo pair
-  shapes what demo mode emits for the datapoint — `demo_value` is the value it
-  sits at in engineering units (a boolean instead gives a resting state),
-  `demo_variance` how far it may wander; null on either restores the default.
+- **Datapoints.** The `datapoints` catalog is the gateway's and is never
+  written. The user-owned settings — `enabled`, `change_detection`,
+  `demo_value`, `demo_variance` — live in `datapoint_settings`;
+  `set_datapoints` checks that each target is live in the catalog (else it
+  rejects with suggestions), then appends a PARTIAL row: `tsp`,
+  `gateway_id`, `asset_name`, `datapoint_id`, the changed columns and the
+  audit column. Omitted settings keep their value; an explicit `null`
+  clears one back to its default. A request that matches the effective
+  value (or clears a setting that is not set) is `no_change` and writes
+  nothing. The gateway follows the table live: all four apply on the next
+  publish cycle WITHOUT restarting the connection, and every write is read
+  back from `datapoint_settings` (`verified` / `superseded`). The demo pair
+  shapes what demo mode emits for the datapoint — `demo_value` is the value
+  it sits at in engineering units (a boolean instead gives a resting state),
+  `demo_variance` how far it may wander. Machine-written catalog columns
+  are rejected.
 - **Delete** is a soft delete (measurement history is retained, the name
-  becomes reusable) and cascades tombstones to the asset's datapoint rows.
-  It is convergent: calling it again finishes a partial cascade.
+  becomes reusable) and writes only the `assets` tombstone; the gateway
+  soft-deletes the asset's catalog rows when it sees it. Deleting an
+  already-deleted asset is `no_change`. Settings rows are left alone (the
+  table has no `deleted` column).
+- **Secret columns.** Apps may declare `secret: true` columns on `assets`;
+  reads return the placeholder `"__secret__"` for a set secret. The tools
+  never write the placeholder back: every append drops a column holding it
+  (carry-over keeps the stored secret), no-change diffs ignore it (also when
+  validate drops the column), and responses show a set secret as `"(set)"`.
+  An agent echoing `"(set)"` or `"__secret__"` back — e.g. re-creating from
+  `previous` — has the column listed in `ignored`; on a revived name the
+  stored secret is kept. Setting a secret is still the user's job (the
+  secret scan below rejects secret-looking columns).
 - **Concurrency.** Mutations are serialized per instance with a lock;
   concurrent board/discovery writers are handled by optional `expected_tsp`
   (compare-and-set against the tsp from `get`) and by `superseded`
@@ -306,7 +359,7 @@ steering text for the agent and are NOT part of the semver contract.
   own form; editing such an asset later still works, because the scan only
   sees the agent's changed fields, never the echo-merged row.
 - **Operator visibility.** Applied mutations emit an info toast (a live
-  audit feed on the board); write failures and partial cascades warn;
+  audit feed on the board); write failures warn;
   internal errors report as errors. Rejections and no-ops stay silent.
 
 ## ai-template blocks (copy-paste per app)
@@ -440,9 +493,9 @@ blocks set. Keep it in `required`.
 
     delete_asset:
       description: >-
-        Soft-deletes one asset and its datapoint catalog; collection stops
-        immediately, measurement history is kept and the name becomes
-        reusable. This is destructive: state exactly what will be deleted
+        Soft-deletes one asset; collection stops immediately, the gateway
+        removes its datapoint catalog, measurement history is kept and the
+        name becomes reusable. This is destructive: state exactly what will be deleted
         and get the user's explicit confirmation before calling. The
         response includes the previous config so an accidental delete can
         be undone via create_asset.
@@ -466,9 +519,11 @@ blocks set. Keep it in `required`.
 
     list_datapoints:
       description: >-
-        Lists the live datapoint catalog of one asset: id, name, units,
-        address details and the per-datapoint enabled / change_detection
-        switches. The catalog itself is derived from the asset's
+        Lists the live datapoint catalog of one asset (id, name, units,
+        address details) with the effective per-datapoint settings enabled,
+        change_detection, demo_value and demo_variance; user_set names the
+        ones the user set (stored in the datapoint_settings table), the rest
+        are defaults. The catalog itself is derived from the asset's
         configuration (or device discovery) - to add or remove datapoints,
         update the asset instead.
       topic: app_datapoints.list
@@ -492,10 +547,12 @@ blocks set. Keep it in `required`.
         stops collecting that datapoint), change_detection (true stores only
         value changes), and for demo mode demo_value (the value it should
         sit at, in engineering units - or a boolean for a resting state) and
-        demo_variance (how far it may wander). Applies on the next cycle
-        WITHOUT restarting the asset's connection. Everything else about a
-        datapoint (address, type, scale) is defined by the asset's
-        configuration - change that instead.
+        demo_variance (how far it may wander). Stored in the
+        datapoint_settings table (null clears a setting back to its
+        default); applies on the next cycle WITHOUT restarting the asset's
+        connection. Everything else about a datapoint (address, type,
+        scale) is defined by the asset's configuration - change that
+        instead.
       topic: app_datapoints.set
       parameters:
         type: object
@@ -558,7 +615,8 @@ text, reusing the write-discipline ideas as it sees fit.
 `config_core.SQL_DIAGNOSTICS_GUIDANCE` — for agents with `data_access`
 enabled: the table schema (`error-logs` with the `msg LIKE 'AssetName: %'`
 prefix convention, `measurements.data` keyed by datapoint id,
-`assetstatus`), the latest/deleted filtering rule on config tables, the
+`assetstatus`, the `datapoints` catalog vs. the user's switches in
+`datapoint_settings`), the latest/deleted filtering rule on config tables, the
 change_detection / demo_mode / store_data caveats and canned example
 queries. Compress both texts as needed to fit your agent's system-prompt
 budget (the ai-template caps it at 25000 chars, and a shorter prompt is
@@ -574,6 +632,46 @@ a drift test asserting your ai-template's config-tool topics are a subset
 of `config_core.DEFAULT_TOPICS` values, that every tool with a `topic`
 declares a required integer `device_key`, and that your board's asset-name
 validation equals `config_core.ASSET_NAME_PATTERN`.
+
+## Migrating from 1.x
+
+2.0.0 follows collector_core v3.0.0's one-writer-per-table split; the two
+are released together.
+
+1. **Pin both:** `collector_core` v3.0.0 and `ironflock-config-core`
+   v2.0.0. 2.0.0 against collector_core 2.x writes switches the gateway
+   does not read; 1.x against 3.0.0 writes the catalog the gateway owns.
+2. **data-template:** add the `datapoint_settings` table —
+   `maintainLatestFlagFor: [gateway_id, asset_name, datapoint_id]`,
+   columns `tsp`, `gateway_id`, `asset_name`, `datapoint_id`, `enabled`,
+   `change_detection`, `demo_value`, `demo_variance`, `configured_by`, with
+   "written by the board and the AI assistant" as its description. The
+   `datapoints` catalog's own column changes (no more `enabled` /
+   `change_detection`) come with collector_core v3.0.0.
+3. **ai-template:** update the `list_datapoints`, `set_datapoints` and
+   `delete_asset` descriptions from the blocks above (switches are stored
+   in `datapoint_settings`, the gateway removes the catalog on delete) and
+   re-paste `SQL_DIAGNOSTICS_GUIDANCE` into the system prompt.
+4. **Code:** `register_asset_tools` takes the new optional
+   `settings_table="datapoint_settings"`; nothing else in the call
+   changes. Drift tests on `USER_DATAPOINT_COLUMNS` keep working.
+
+Contract changes an app or prompt may notice:
+
+- `delete` no longer returns `datapoints_deleted` / `datapoints_failed`
+  (there is no cascade to count); deleting an already-deleted asset is
+  always `no_change` (no orphan re-sweep).
+- `list_datapoints` returns effective values plus `user_set`, and
+  rejects a deleted asset (`not_found`); `set_datapoints` writes only the
+  columns that change, carries `verified` per applied item and rejects a
+  deleted asset.
+- `get`'s `datapoints.disabled` / `change_detection` count effective
+  settings.
+- Set `secret: true` values show as `"(set)"` in every response.
+- `AssetStore` (internal) lost `append_datapoint`,
+  `check_datapoint_payload` and `cascade_delete_datapoints`, and gained
+  `read_settings`, `append_setting`, `check_setting_payload`,
+  `verify_settings`.
 
 ## Versioning and releases
 

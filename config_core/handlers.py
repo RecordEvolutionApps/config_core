@@ -5,8 +5,8 @@ injected function (``validate(config, existing) -> (valid_config, problems)``,
 fail-closed); this module owns everything repetitive -- identity and
 protected-column rules, echo-merged validate candidates with diff-only
 writes (the platform's carry-over merge fills the rest), idempotent
-no-change skips, soft delete, read-back verification and the structured
-response envelope. What KIND of row is being managed comes in as an ``_Entity``
+no-change skips, soft delete, read-back verification, secret-placeholder
+hygiene and the structured response envelope. What KIND of row is being managed comes in as an ``_Entity``
 (defaults, column hygiene, prose); the collector family's entity and its
 datapoint tools live in ``collector.py``, whose historical constants this
 module still re-exports via a lazy ``__getattr__`` at the bottom.
@@ -26,6 +26,9 @@ from dataclasses import dataclass
 from .store import (
     PLATFORM_COLUMNS,
     RUNTIME_KEYS,
+    SECRET_DISPLAY,
+    is_secret_placeholder,
+    mask_secrets,
     normalized_diff,
     now_iso,
     strip_platform,
@@ -371,6 +374,24 @@ def _same_gateway(value, device_key):
         return False
 
 
+def _drop_secret_echoes(fields, existing):
+    """(clean_fields, ignored) -- drop the agent's echoes of a secret
+    column: the platform placeholder itself, or the "(set)" marker our
+    responses show where the stored value is the placeholder. Writing
+    either would replace the real secret with a marker string."""
+    clean, ignored = {}, []
+    for key, value in fields.items():
+        if is_secret_placeholder(value) or (
+            value == SECRET_DISPLAY
+            and existing is not None
+            and is_secret_placeholder(existing.get(key))
+        ):
+            ignored.append(key)
+            continue
+        clean[key] = value
+    return clean, ignored
+
+
 def _coerce_bool(value):
     """(bool_or_None, problem_or_None) -- strict: only real booleans and the
     unambiguous spellings coerce. The collector's pause switch is null-safe
@@ -627,20 +648,9 @@ async def get_asset(store, cfg, asset_name):
         extra["live_status"] = live_status
 
     if store.datapoints_table:
-        dp_rows, dp_err = await store.read_datapoints(name)
-        if dp_err is not None:
-            warnings.append(f"datapoint catalog unavailable: {dp_err}")
-        live_dps = [r for r in dp_rows if not r.get("deleted")]
-        extra["datapoints"] = {
-            "count": len(live_dps),
-            "disabled": sum(1 for r in live_dps if r.get("enabled") is False),
-            "change_detection": sum(
-                1 for r in live_dps if bool(r.get("change_detection"))
-            ),
-            "ids": sorted(
-                str(r.get("datapoint_id")) for r in live_dps
-            )[:DATAPOINT_ID_PREVIEW],
-        }
+        from .collector import datapoint_summary
+        extra["datapoints"], dp_warnings = await datapoint_summary(store, name)
+        warnings += dp_warnings
 
     meta = {"tsp": row.get("tsp"), "last_changed_by": row.get("authid")}
     if "auto_registered" in row:
@@ -714,6 +724,10 @@ async def create_asset(store, cfg, asset_name, fields=None, dry_run=False):
                       "Remove the protected fields and retry."),
             ignored=ignored,
         )
+    # A revived name keeps a stored secret the agent echoed from 'previous'
+    # (carry-over crosses the tombstone); any other echo is just dropped.
+    clean, secret_echoes = _drop_secret_echoes(clean, existing)
+    ignored += secret_echoes
     candidate = dict(cfg.entity.create_defaults)
     candidate.update(clean)
     candidate, problems = _entity_coerce(cfg, candidate)
@@ -752,7 +766,7 @@ async def create_asset(store, cfg, asset_name, fields=None, dry_run=False):
         # every column of the dead row the new configuration does not set,
         # so a revived name cannot silently inherit stale values.
         for column in strip_platform(existing):
-            if column not in row:
+            if column not in row and column not in secret_echoes:
                 row[column] = None
     size_problem = _row_size_problem(row)
     if size_problem:
@@ -860,6 +874,8 @@ async def update_asset(store, cfg, asset_name, changes=None,
                       "Remove the protected fields and retry."),
             ignored=ignored,
         )
+    clean, secret_echoes = _drop_secret_echoes(clean, existing)
+    ignored += secret_echoes
     if not clean:
         return _finish(
             _ok(
@@ -1009,43 +1025,13 @@ async def delete_asset(store, cfg, asset_name, expected_tsp=None,
             cfg, name, rows, extra_hint="Nothing was deleted."
         )
 
-    live_dps, warnings = [], []
-    if store.datapoints_table:
-        dp_rows, dp_err = await store.read_datapoints(name)
-        live_dps = [r for r in dp_rows if not r.get("deleted")]
-        if dp_err is not None:
-            warnings.append(f"datapoint catalog unavailable: {dp_err}")
-
     if existing.get("deleted"):
-        # Convergent: finish whatever a partial earlier delete left behind.
-        if not live_dps:
-            return _ok(
-                "no_change",
-                f"{noun.capitalize()} {name!r} is already deleted.",
-                changed=False,
-            )
-        if dry_run:
-            return _ok(
-                "dry_run",
-                f"Asset {name!r} is already deleted, but "
-                f"{len(live_dps)} orphaned datapoint entries remain - "
-                "re-calling without dry_run cleans them up.",
-                changed=True, datapoints_to_delete=len(live_dps),
-            )
-        deleted_count, failures = await store.cascade_delete_datapoints(
-            name, audit=cfg.audit()
-        )
-        return _finish(
-            _ok(
-                "deleted",
-                "Cleaned up the orphaned datapoint entries of the already-"
-                "deleted asset."
-                + (" Some entries failed - call delete_asset again to "
-                   "finish." if failures else ""),
-                changed=True, datapoints_deleted=deleted_count,
-                datapoints_failed=len(failures),
-            ),
-            warnings=warnings + failures,
+        # The gateway soft-deletes a deleted asset's datapoint catalog
+        # itself (one writer per table) - nothing is left to finish here.
+        return _ok(
+            "no_change",
+            f"{noun.capitalize()} {name!r} is already deleted.",
+            changed=False,
         )
 
     if expected_tsp is not None and str(expected_tsp) != str(existing.get("tsp")):
@@ -1063,10 +1049,16 @@ async def delete_asset(store, cfg, asset_name, expected_tsp=None,
             "hint": "Re-read with get_asset, confirm with the user, then delete.",
         }
 
+    warnings = []
     if dry_run:
         extra = {}
         dp_clause = ""
         if store.datapoints_table:
+            # Informational: the gateway removes the catalog on delete.
+            dp_rows, dp_err = await store.read_datapoints(name)
+            live_dps = [r for r in dp_rows if not r.get("deleted")]
+            if dp_err is not None:
+                warnings.append(f"datapoint catalog unavailable: {dp_err}")
             dp_clause = f" and its {len(live_dps)} datapoint entries"
             extra["datapoints_to_delete"] = len(live_dps)
         return _finish(
@@ -1110,51 +1102,24 @@ async def delete_asset(store, cfg, asset_name, expected_tsp=None,
             "then retry.",
         )
 
-    extra = {}
-    deleted_count, failures = 0, []
-    if store.datapoints_table:
-        deleted_count, failures = await store.cascade_delete_datapoints(
-            name, audit=cfg.audit()
-        )
-        extra["datapoints_deleted"] = deleted_count
-        extra["datapoints_failed"] = len(failures)
     verdict, _, detail = await store.verify_asset(name, tombstone["tsp"])
-    toast = f"AI assistant deleted {noun} '{name}'"
-    if deleted_count:
-        toast += f" ({deleted_count} datapoint entries removed)"
-    if store.datapoints_table:
-        message = (
-            f"agent deleted {noun} {name!r} "
-            f"(datapoints removed: {deleted_count}, failed: {len(failures)})"
-        )
-    else:
-        message = f"agent deleted {noun} {name!r}"
     await store.notify(
-        message,
-        level="warn" if failures else "info",
-        user_message=toast + ".",
+        f"agent deleted {noun} {name!r}",
+        level="info",
+        user_message=f"AI assistant deleted {noun} '{name}'.",
     )
     hint = cfg.entity.hints.delete_success
-    if failures:
-        hint += (
-            f" {len(failures)} datapoint entries could not be cleaned up - "
-            "call delete_asset again to finish."
-        )
     if verdict != "verified":
         hint += (
             " The delete could not be re-read"
             + (f" ({detail})" if detail else "")
             + " - confirm with get_asset."
         )
-    return _finish(
-        _ok(
-            "deleted", hint,
-            asset_name=name, changed=True,
-            verified=verdict == "verified",
-            previous=_spec_for_response(strip_platform(existing)),
-            **extra,
-        ),
-        warnings=warnings + failures,
+    return _ok(
+        "deleted", hint,
+        asset_name=name, changed=True,
+        verified=verdict == "verified",
+        previous=_spec_for_response(strip_platform(existing)),
     )
 
 
@@ -1174,8 +1139,8 @@ def rpc_handlers(store, cfg):
                 params = coerce_rpc_args(args, kwargs, positional)
                 if mutating:
                     async with cfg.lock:
-                        return await op(**params)
-                return await op(**params)
+                        return mask_secrets(await op(**params))
+                return mask_secrets(await op(**params))
             except TypeError as e:
                 return _rejected(
                     "invalid_value",
@@ -1257,10 +1222,11 @@ def rpc_handlers(store, cfg):
         handlers["list_datapoints"] = wrap(
             _list_datapoints, ("asset_name",), mutating=False
         )
-        handlers["set_datapoints"] = wrap(
-            _set_datapoints, ("asset_name", "changes", "dry_run"),
-            mutating=True,
-        )
+        if store.settings_table:
+            handlers["set_datapoints"] = wrap(
+                _set_datapoints, ("asset_name", "changes", "dry_run"),
+                mutating=True,
+            )
 
     return handlers
 

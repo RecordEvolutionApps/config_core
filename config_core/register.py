@@ -10,8 +10,9 @@ durable.
 Two entry points, one wire contract:
 
 * ``register_asset_tools`` -- the collector preset: the ``assets`` /
-  ``datapoints`` / ``assetstatus`` tables, the collector_core contract
-  columns seeded and coerced, the datapoint tools, collector prose.
+  ``datapoints`` (read-only catalog) / ``datapoint_settings`` /
+  ``assetstatus`` tables, the collector_core contract columns seeded and
+  coerced, the datapoint tools, collector prose.
 * ``register_config_tools`` -- the generic form: any named-row config table,
   no seeding beyond what the app declares, no datapoint tools. The wire
   vocabulary (topics ``app_assets.*``, parameter ``asset_name``, response
@@ -47,7 +48,8 @@ _CRUD_OPS = ("list", "get", "create", "update", "delete")
 async def register_asset_tools(ironflock, validate, topics=DEFAULT_TOPICS,
                                name_pattern=ASSET_NAME_PATTERN,
                                audit_column=None, max_assets=200,
-                               device_key=None):
+                               device_key=None,
+                               settings_table="datapoint_settings"):
     """Register the collector asset CRUD endpoints. Returns the list of
     topics that FAILED to register (empty = success). Never raises: a
     config-tools outage must degrade the assistant, not the app.
@@ -85,6 +87,16 @@ async def register_asset_tools(ironflock, validate, topics=DEFAULT_TOPICS,
     "agent" on every write when the app's data-template declares the column.
     ``device_key`` defaults to the platform-injected DEVICE_KEY env var.
 
+    Datapoints (collector_core >= 3.0.0, one writer per table): the
+    ``datapoints`` catalog is the gateway's and is only READ;
+    ``settings_table`` (default "datapoint_settings") holds the user-owned
+    per-datapoint settings, which ``set_datapoints`` writes as partial rows
+    and ``list_datapoints`` merges over the catalog. ``settings_table=None``
+    drops the ``set_datapoints`` tool (and shows catalog/default values
+    only). The audit column, when given, is stamped on settings rows too.
+    Deleting an asset writes only its ``assets`` tombstone: the gateway
+    soft-deletes the asset's catalog rows itself.
+
     All operator notification -- registration failures, applied-write audit
     toasts, failure warns -- goes through ``ironflock.report_error``
     directly; there is no report callback.
@@ -93,9 +105,12 @@ async def register_asset_tools(ironflock, validate, topics=DEFAULT_TOPICS,
     merged.update(topics or {})
     wanted = {op: topic for op, topic in merged.items()
               if op in DEFAULT_TOPICS and topic}
+    if not settings_table:
+        wanted.pop("set_datapoints", None)
 
     def make_tools(device_key_int):
-        store = AssetStore(ironflock, device_key_int)
+        store = AssetStore(ironflock, device_key_int,
+                           settings_table=settings_table)
         cfg = ToolConfig(validate, name_pattern=name_pattern,
                          audit_column=audit_column, max_assets=max_assets)
         return store, cfg
@@ -161,7 +176,8 @@ async def register_config_tools(ironflock, validate, table, *,
 
     def make_tools(device_key_int):
         store = AssetStore(ironflock, device_key_int, table=table,
-                           datapoints_table=None, status_table=status_table)
+                           datapoints_table=None, settings_table=None,
+                           status_table=status_table)
         cfg = ToolConfig(validate, name_pattern=name_pattern,
                          audit_column=audit_column, max_assets=max_entries,
                          entity=entity)

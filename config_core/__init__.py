@@ -3,12 +3,13 @@
 The app owns its config-row shape and validates it through ONE injected
 function; this library owns the repetitive CRUD plumbing (reads, echo-merge
 writes, soft delete, verification, never-raise agent responses).
-``register_asset_tools`` is the collector preset (assets + datapoints +
-assetstatus); ``register_config_tools`` manages any named-row config table.
+``register_asset_tools`` is the collector preset (assets, the read-only
+datapoints catalog, datapoint_settings, assetstatus);
+``register_config_tools`` manages any named-row config table.
 See README.md for the full contract.
 """
 
-__version__ = "1.3.1"
+__version__ = "2.0.0"
 
 from .collector import (
     RECOMMENDED_PROMPT_GUIDANCE,

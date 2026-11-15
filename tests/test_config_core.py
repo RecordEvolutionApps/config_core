@@ -94,6 +94,19 @@ def seed_datapoint(fake, asset_name, datapoint_id, gateway_id=DEVICE_KEY,
     return fake.external_append("datapoints", row)
 
 
+def seed_setting(fake, asset_name, datapoint_id, gateway_id=DEVICE_KEY,
+                 authid="user-9", **columns):
+    """A board-written datapoint_settings row (partial, like the board's)."""
+    row = {
+        "tsp": now_iso(),
+        "gateway_id": gateway_id,
+        "asset_name": asset_name,
+        "datapoint_id": datapoint_id,
+    }
+    row.update(columns)
+    return fake.external_append("datapoint_settings", row, authid=authid)
+
+
 def check(response):
     """Contract assertions shared by every test: serializable + envelope."""
     json.dumps(response)
@@ -670,32 +683,32 @@ async def test_update_auto_registered_warning():
 # ------------------------------------------------------------------ delete
 
 
-async def test_delete_tombstone_and_cascade():
+async def test_delete_writes_only_the_asset_tombstone():
+    """One writer per table: the gateway soft-deletes the catalog, the
+    library writes the assets tombstone and nothing else."""
     fake, _, _, handlers = make_tools(audit_column="configured_by")
     seed_asset(fake, "Press 1", host="10.0.0.5")
     seed_datapoint(fake, "Press 1", "temp")
     seed_datapoint(fake, "Press 1", "pressure")
-    seed_datapoint(fake, "Press 1", "gone", deleted=True)
+    seed_setting(fake, "Press 1", "temp", enabled=False)
     response = check(await handlers["delete"](asset_name="Press 1"))
     assert response["ok"] is True and response["status"] == "deleted"
-    assert response["datapoints_deleted"] == 2
-    assert response["datapoints_failed"] == 0
+    assert response["verified"] is True
+    assert "datapoints_deleted" not in response
+    assert "datapoints_failed" not in response
     assert response["previous"]["host"] == "10.0.0.5"
     row = fake.latest("assets", asset_name="Press 1")
     assert row["deleted"] is True and row["configured_by"] == "agent"
-    for dp in ("temp", "pressure"):
-        assert fake.latest("datapoints", asset_name="Press 1",
-                           datapoint_id=dp)["deleted"] is True
-    # ordering: the asset tombstone is appended before any datapoint tombstone
-    appends = [t for m, t in fake.calls if m == "append_to_table"]
-    assert appends[0] == "assets"
-    assert set(appends[1:3]) == {"datapoints"}
+    assert [t for t, _ in fake.payloads] == ["assets"]
+    assert fake.latest("datapoints", datapoint_id="temp")["deleted"] is False
+    assert ("getHistory", "datapoints") not in fake.calls
 
 
 async def test_delete_missing_and_dry_run():
     fake, _, _, handlers = make_tools()
     seed_asset(fake, "Press 1")
     seed_datapoint(fake, "Press 1", "temp")
+    seed_datapoint(fake, "Press 1", "gone", deleted=True)
     response = check(await handlers["delete"](asset_name="Pres 1"))
     assert response["ok"] is False and response["code"] == "not_found"
     response = check(await handlers["delete"](asset_name="Press 1",
@@ -703,64 +716,66 @@ async def test_delete_missing_and_dry_run():
     assert response["status"] == "dry_run"
     assert response["datapoints_to_delete"] == 1
     assert fake.latest("assets", asset_name="Press 1")["deleted"] is False
+    assert fake.payloads == []
 
 
-async def test_delete_already_deleted_resweeps_orphans():
+async def test_delete_already_deleted_is_no_change():
+    """No orphan re-sweep any more: the gateway owns the catalog."""
     fake, _, _, handlers = make_tools()
     seed_asset(fake, "Press 1", deleted=True)
+    seed_datapoint(fake, "Press 1", "not yet swept")
     response = check(await handlers["delete"](asset_name="Press 1"))
     assert response["status"] == "no_change"
-    seed_datapoint(fake, "Press 1", "orphan")
-    response = check(await handlers["delete"](asset_name="Press 1"))
-    assert response["status"] == "deleted"
-    assert response["datapoints_deleted"] == 1
-    assert fake.latest("datapoints", datapoint_id="orphan")["deleted"] is True
-
-
-async def test_delete_partial_cascade_reports_failures():
-    fake, _, _, handlers = make_tools()
-    seed_asset(fake, "Press 1")
-    seed_datapoint(fake, "Press 1", "a")
-    seed_datapoint(fake, "Press 1", "b")
-    # first append (tombstone) succeeds, second (datapoint a) fails
-    fake.fail_next("append_to_table", n=0)
-
-    async def run_with_one_dp_failure():
-        original = fake.append_to_table
-        state = {"count": 0}
-
-        async def flaky(table, payload):
-            state["count"] += 1
-            if state["count"] == 2:
-                raise RuntimeError("append to datapoints interrupted")
-            return await original(table, payload)
-
-        fake.append_to_table = flaky
-        try:
-            return await handlers["delete"](asset_name="Press 1")
-        finally:
-            fake.append_to_table = original
-
-    response = check(await run_with_one_dp_failure())
-    assert response["ok"] is True and response["status"] == "deleted"
-    assert response["datapoints_deleted"] == 1
-    assert response["datapoints_failed"] == 1
-    assert "again" in response["hint"]
-    assert any(r["level"] == "warn" for r in fake.reported)
+    assert fake.payloads == []
 
 
 # -------------------------------------------------------------- datapoints
 
 
-async def test_list_datapoints():
+async def test_list_datapoints_effective_values():
     fake, _, _, handlers = make_tools()
     seed_asset(fake, "Press 1")
-    seed_datapoint(fake, "Press 1", "temp", units="degC", address="DB1.DBW2")
+    seed_datapoint(fake, "Press 1", "temp", units="degC", address="DB1.DBW2",
+                   demo_value=20.0, demo_variance=1.0)
+    seed_datapoint(fake, "Press 1", "pressure")
     seed_datapoint(fake, "Press 1", "old", deleted=True)
+    seed_setting(fake, "Press 1", "temp", enabled=False, demo_value=75.0)
+    seed_setting(fake, "Press 1", "old", enabled=False)   # orphan: not listed
     response = check(await handlers["list_datapoints"](asset_name="Press 1"))
-    assert response["count"] == 1
-    assert response["datapoints"][0]["datapoint_id"] == "temp"
-    assert "authid" not in response["datapoints"][0]
+    assert response["count"] == 2
+    pressure, temp = response["datapoints"]
+    assert temp["datapoint_id"] == "temp" and temp["units"] == "degC"
+    assert temp["enabled"] is False and temp["change_detection"] is False
+    assert temp["demo_value"] == 75.0 and temp["demo_variance"] == 1.0
+    assert temp["user_set"] == ["enabled", "demo_value"]
+    assert pressure["enabled"] is True and "user_set" not in pressure
+    assert pressure["demo_value"] is None
+    assert "authid" not in temp
+
+
+async def test_list_datapoints_reads_settings_of_this_gateway_only():
+    fake, _, _, handlers = make_tools()
+    seed_asset(fake, "Press 1")
+    seed_datapoint(fake, "Press 1", "temp")
+    seed_setting(fake, "Press 1", "temp", gateway_id=OTHER_GATEWAY,
+                 enabled=False)
+    response = check(await handlers["list_datapoints"](asset_name="Press 1"))
+    assert response["datapoints"][0]["enabled"] is True
+
+
+async def test_datapoint_tools_reject_a_deleted_asset():
+    fake, _, _, handlers = make_tools()
+    seed_asset(fake, "Press 1", deleted=True)
+    seed_datapoint(fake, "Press 1", "temp")   # catalog not swept yet
+    for response in (
+        await handlers["list_datapoints"](asset_name="Press 1"),
+        await handlers["set_datapoints"](
+            asset_name="Press 1",
+            changes={"datapoint_id": "temp", "enabled": False}),
+    ):
+        check(response)
+        assert response["ok"] is False and response["code"] == "not_found"
+    assert fake.payloads == []
 
 
 async def test_set_datapoints_machine_owned_rejected():
@@ -775,33 +790,91 @@ async def test_set_datapoints_machine_owned_rejected():
     item = response["results"][0]
     assert item["status"] == "rejected"
     assert "discovery" in " ".join(item["problems"])
+    assert fake.payloads == []
 
 
-async def test_set_datapoints_batch_and_crash_class_invariants():
+async def test_set_datapoints_batch_writes_settings_never_the_catalog():
     fake, _, _, handlers = make_tools()
     seed_asset(fake, "Press 1")
     seed_datapoint(fake, "Press 1", "temp")
-    seed_datapoint(fake, "Press 1", "pressure", enabled=True)
+    seed_datapoint(fake, "Press 1", "pressure")
+    seed_datapoint(fake, "Press 1", "gone", deleted=True)
     response = check(await handlers["set_datapoints"](
         asset_name="Press 1",
         changes=[
             {"datapoint_id": "temp", "enabled": False},
-            {"datapoint_id": "pressure", "enabled": True},   # no-op
+            {"datapoint_id": "pressure", "enabled": True},   # default: no-op
             {"datapoint_id": "tmep", "enabled": False},      # typo
+            {"datapoint_id": "gone", "enabled": False},      # not live
         ],
     ))
     assert response["applied"] == 1
     assert response["no_change"] == 1
-    assert response["rejected"] == 1
+    assert response["rejected"] == 2
     assert response["results"][2]["suggestions"] == ["temp"]
-    # every datapoints row ever appended carries the crash-class keys
-    for row in fake.rows("datapoints"):
-        assert row["datapoint_id"]
-        assert row["asset_name"]
-        assert isinstance(row["deleted"], bool)
-    changed = fake.latest("datapoints", datapoint_id="temp")
-    assert changed["enabled"] is False
-    assert changed["name"] == "temp"  # echo-merge preserved machine columns
+    assert response["results"][0]["verified"] is True
+    assert [t for t, _ in fake.payloads] == ["datapoint_settings"]
+    assert not any(t == "datapoints" for m, t in fake.calls
+                   if m == "append_to_table")
+    setting = fake.latest("datapoint_settings", datapoint_id="temp")
+    assert setting["enabled"] is False
+    assert setting["asset_name"] == "Press 1"
+    assert setting["gateway_id"] == DEVICE_KEY
+    assert "deleted" not in setting
+
+
+async def test_set_datapoints_writes_partial_settings_rows():
+    fake, _, _, handlers = make_tools(audit_column="configured_by")
+    seed_asset(fake, "Press 1")
+    seed_datapoint(fake, "Press 1", "temp", address="DB1.0")
+    seed_setting(fake, "Press 1", "temp", change_detection=True,
+                 configured_by="user")
+    response = check(await handlers["set_datapoints"](
+        asset_name="Press 1",
+        changes={"datapoint_id": "temp", "enabled": False,
+                 "change_detection": True}))    # the latter is a no-op
+    assert response["applied"] == 1
+    assert response["results"][0]["applied"] == {"enabled": False}
+    table, payload = fake.payloads[-1]
+    assert table == "datapoint_settings"
+    assert set(payload) == {"tsp", "gateway_id", "asset_name",
+                            "datapoint_id", "enabled", "configured_by"}
+    assert payload["configured_by"] == "agent"
+    row = fake.latest("datapoint_settings", datapoint_id="temp")
+    # carry-over keeps the board's earlier setting
+    assert row["enabled"] is False and row["change_detection"] is True
+
+
+async def test_set_datapoints_no_audit_column_without_audit():
+    fake, _, _, handlers = make_tools()
+    seed_asset(fake, "Press 1")
+    seed_datapoint(fake, "Press 1", "temp")
+    check(await handlers["set_datapoints"](
+        asset_name="Press 1", changes={"datapoint_id": "temp",
+                                       "change_detection": True}))
+    _, payload = fake.payloads[-1]
+    assert set(payload) == {"tsp", "gateway_id", "asset_name",
+                            "datapoint_id", "change_detection"}
+
+
+async def test_set_datapoints_no_change_against_effective_value():
+    fake, _, _, handlers = make_tools()
+    seed_asset(fake, "Press 1")
+    seed_datapoint(fake, "Press 1", "temp", demo_value="20", demo_variance=1)
+    seed_datapoint(fake, "Press 1", "running")
+    seed_setting(fake, "Press 1", "running", enabled=False)
+    response = check(await handlers["set_datapoints"](
+        asset_name="Press 1",
+        changes=[
+            {"datapoint_id": "temp", "demo_value": 20},     # catalog default
+            {"datapoint_id": "temp", "enabled": True},      # built-in default
+            {"datapoint_id": "temp", "change_detection": False},
+            {"datapoint_id": "temp", "demo_value": None},   # nothing to clear
+            {"datapoint_id": "running", "enabled": False},  # user setting
+        ],
+    ))
+    assert response["no_change"] == 5 and response["applied"] == 0
+    assert fake.payloads == []
 
 
 async def test_set_datapoints_demo_settings():
@@ -817,15 +890,17 @@ async def test_set_datapoints_demo_settings():
         ],
     ))
     assert response["applied"] == 2
-    temp = fake.latest("datapoints", datapoint_id="temp")
+    temp = fake.latest("datapoint_settings", datapoint_id="temp")
     assert temp["demo_value"] == 75.0 and temp["demo_variance"] == 2.0
-    assert fake.latest("datapoints", datapoint_id="running")["demo_value"] is True
+    running = fake.latest("datapoint_settings", datapoint_id="running")
+    assert running["demo_value"] is True
 
 
 async def test_set_datapoints_demo_settings_rejected_and_cleared():
     fake, _, _, handlers = make_tools()
     seed_asset(fake, "Press 1")
-    seed_datapoint(fake, "Press 1", "temp", demo_value=75.0)
+    seed_datapoint(fake, "Press 1", "temp", demo_value=20.0)
+    seed_setting(fake, "Press 1", "temp", demo_value=75.0)
     response = check(await handlers["set_datapoints"](
         asset_name="Press 1",
         changes=[
@@ -835,13 +910,31 @@ async def test_set_datapoints_demo_settings_rejected_and_cleared():
     ))
     assert response["rejected"] == 2
     assert "not a number" in " ".join(response["results"][0]["problems"])
-    # an explicit null restores the default range
+    # an explicit null clears the setting: the catalog default applies again
     response = check(await handlers["set_datapoints"](
         asset_name="Press 1",
         changes={"datapoint_id": "temp", "demo_value": None},
     ))
     assert response["applied"] == 1
-    assert fake.latest("datapoints", datapoint_id="temp")["demo_value"] is None
+    _, payload = fake.payloads[-1]
+    assert "demo_value" in payload and payload["demo_value"] is None
+    assert fake.latest("datapoint_settings",
+                       datapoint_id="temp")["demo_value"] is None
+    response = check(await handlers["list_datapoints"](asset_name="Press 1"))
+    assert response["datapoints"][0]["demo_value"] == 20.0
+    assert "user_set" not in response["datapoints"][0]
+
+
+async def test_set_datapoints_same_datapoint_twice_in_one_batch():
+    fake, _, _, handlers = make_tools()
+    seed_asset(fake, "Press 1")
+    seed_datapoint(fake, "Press 1", "temp")
+    response = check(await handlers["set_datapoints"](
+        asset_name="Press 1",
+        changes=[{"datapoint_id": "temp", "enabled": False},
+                 {"datapoint_id": "temp", "enabled": False}],
+    ))
+    assert response["applied"] == 1 and response["no_change"] == 1
 
 
 async def test_set_datapoints_cap_and_dry_run():
@@ -859,7 +952,110 @@ async def test_set_datapoints_cap_and_dry_run():
         dry_run=True,
     ))
     assert response["results"][0]["status"] == "dry_run"
-    assert fake.latest("datapoints", datapoint_id="temp").get("enabled") is not False
+    assert response["results"][0]["would_write"] == {"enabled": False}
+    assert fake.payloads == []
+
+
+async def test_set_datapoints_superseded_and_unverified():
+    fake, _, _, handlers = make_tools()
+    seed_asset(fake, "Press 1")
+    seed_datapoint(fake, "Press 1", "temp")
+    seed_datapoint(fake, "Press 1", "pressure")
+
+    def board_writes_after_us(table, row):
+        if table == "datapoint_settings" and row["datapoint_id"] == "temp":
+            fake.on_append(None)
+            later = datetime.fromisoformat(row["tsp"]).timestamp() + 5
+            seed_setting(fake, "Press 1", "temp", enabled=True,
+                         tsp=datetime.fromtimestamp(later).astimezone()
+                         .isoformat())
+
+    fake.on_append(board_writes_after_us)
+    response = check(await handlers["set_datapoints"](
+        asset_name="Press 1",
+        changes={"datapoint_id": "temp", "enabled": False}))
+    result = response["results"][0]
+    assert result["status"] == "applied" and result["verified"] is False
+    assert result["superseded"] is True
+    assert result["current"]["enabled"] is True
+    assert "user-9" in result["detail"]
+
+    fake.defer_visibility = True
+    response = check(await handlers["set_datapoints"](
+        asset_name="Press 1",
+        changes={"datapoint_id": "pressure", "enabled": False}))
+    result = response["results"][0]
+    assert result["status"] == "applied" and result["verified"] is False
+    assert "list_datapoints" in response["hint"]
+
+
+async def test_set_datapoints_settings_read_failure_is_link_error():
+    fake, _, _, handlers = make_tools()
+    seed_asset(fake, "Press 1")
+    seed_datapoint(fake, "Press 1", "temp")
+    original = fake.getHistory
+
+    async def flaky(table, params):
+        if table == "datapoint_settings":
+            raise RuntimeError("settings service down")
+        return await original(table, params)
+
+    fake.getHistory = flaky
+    response = check(await handlers["set_datapoints"](
+        asset_name="Press 1", changes={"datapoint_id": "temp",
+                                       "enabled": False}))
+    assert response["code"] == "link_error"
+    assert "settings service down" in response["error"]
+    assert fake.payloads == []
+
+
+async def test_settings_poison_row_invariants():
+    fake, store, _, _ = make_tools()
+    good = {"tsp": now_iso(), "gateway_id": DEVICE_KEY,
+            "asset_name": "Press 1", "datapoint_id": "temp", "enabled": False}
+    assert store.check_setting_payload(good) is None
+    assert store.check_setting_payload(
+        dict(good, configured_by="agent"), audit_column="configured_by"
+    ) is None
+    for bad in (
+        dict(good, datapoint_id=""),
+        dict(good, asset_name=None),
+        dict(good, gateway_id=OTHER_GATEWAY),
+        dict(good, tsp=None),
+        dict(good, deleted=False),            # not a settings column
+        dict(good, address="DB1.0"),          # a catalog column
+        dict(good, configured_by="agent"),    # audit column not declared
+        dict(good, authid="x"),
+        {k: v for k, v in good.items() if k != "enabled"},   # no setting
+    ):
+        assert store.check_setting_payload(bad), bad
+    acked, err = await store.append_setting(dict(good, deleted=False))
+    assert acked is False and "invariant" in err
+    assert fake.payloads == []
+
+
+async def test_settings_table_none_drops_the_set_tool():
+    fake = FakeIronflock(device_key=DEVICE_KEY)
+    failed = await register_asset_tools(fake, passthrough,
+                                        device_key=DEVICE_KEY,
+                                        settings_table=None)
+    assert failed == []
+    assert DEFAULT_TOPICS["set_datapoints"] not in fake.registered
+    assert DEFAULT_TOPICS["list_datapoints"] in fake.registered
+
+
+async def test_register_asset_tools_custom_settings_table():
+    fake = FakeIronflock(device_key=DEVICE_KEY)
+    await register_asset_tools(fake, passthrough, device_key=DEVICE_KEY,
+                               settings_table="dp_prefs")
+    seed_asset(fake, "Press 1")
+    seed_datapoint(fake, "Press 1", "temp")
+    handler = fake.registered[DEFAULT_TOPICS["set_datapoints"]]
+    response = await handler(asset_name="Press 1",
+                             changes={"datapoint_id": "temp",
+                                      "enabled": False})
+    assert response["applied"] == 1
+    assert [t for t, _ in fake.payloads] == ["dp_prefs"]
 
 
 # -------------------------------------------------------------------- list
@@ -920,8 +1116,12 @@ async def test_get_full_shape():
     fake, _, _, handlers = make_tools(audit_column="configured_by")
     seed_asset(fake, "Press 1", host="10.0.0.5", auto_registered=False,
                configured_by="user")
-    seed_datapoint(fake, "Press 1", "temp", enabled=False)
-    seed_datapoint(fake, "Press 1", "pressure", change_detection=True)
+    seed_datapoint(fake, "Press 1", "temp")
+    seed_datapoint(fake, "Press 1", "pressure")
+    seed_datapoint(fake, "Press 1", "flow")
+    seed_setting(fake, "Press 1", "temp", enabled=False)
+    seed_setting(fake, "Press 1", "pressure", change_detection=True)
+    seed_setting(fake, "Press 1", "flow", enabled=None)  # cleared = default
     fake.external_append("assetstatus", {
         "tsp": now_iso(), "asset_name": "Press 1", "gateway_id": DEVICE_KEY,
         "status": "offline", "detail": "connection refused", "deleted": False,
@@ -931,7 +1131,7 @@ async def test_get_full_shape():
     assert response["asset"]["host"] == "10.0.0.5"
     assert "authid" not in response["asset"]
     assert response["live_status"]["detail"] == "connection refused"
-    assert response["datapoints"]["count"] == 2
+    assert response["datapoints"]["count"] == 3
     assert response["datapoints"]["disabled"] == 1
     assert response["datapoints"]["change_detection"] == 1
     assert response["_meta"]["configured_by"] == "user"
@@ -1341,40 +1541,101 @@ async def test_recreate_deleted_name_nulls_stale_columns():
     assert row["deleted"] is False
 
 
-async def test_delete_writes_partial_tombstones():
+async def test_delete_writes_partial_tombstone():
     fake, _, _, handlers = make_tools(audit_column="configured_by")
     seed_asset(fake, "Press 1", host="10.0.0.5")
-    seed_datapoint(fake, "Press 1", "temp", address="DB1.0")
     response = check(await handlers["delete"](asset_name="Press 1"))
-    assert response["ok"] is True and response["datapoints_deleted"] == 1
-    asset_payloads = [p for t, p in fake.payloads if t == "assets"]
-    dp_payloads = [p for t, p in fake.payloads if t == "datapoints"]
-    assert set(asset_payloads[-1]) == {"asset_name", "gateway_id", "deleted",
-                                       "tsp", "configured_by"}
-    assert set(dp_payloads[-1]) == {"asset_name", "datapoint_id",
-                                    "gateway_id", "deleted", "tsp",
-                                    "configured_by"}
-    # carry-over keeps the dead rows' configuration visible
+    assert response["ok"] is True
+    (table, payload), = fake.payloads
+    assert table == "assets"
+    assert set(payload) == {"asset_name", "gateway_id", "deleted",
+                            "tsp", "configured_by"}
+    # carry-over keeps the dead row's configuration visible
     assert fake.latest("assets", asset_name="Press 1")["host"] == "10.0.0.5"
-    dead_dp = fake.latest("datapoints", asset_name="Press 1",
-                          datapoint_id="temp")
-    assert dead_dp["deleted"] is True and dead_dp["address"] == "DB1.0"
 
 
-async def test_set_datapoints_writes_partial():
-    fake, _, _, handlers = make_tools()
-    seed_asset(fake, "Press 1")
-    seed_datapoint(fake, "Press 1", "temp", address="DB1.0", enabled=True)
-    response = check(await handlers["set_datapoints"](
-        asset_name="Press 1", changes={"datapoint_id": "temp",
-                                       "enabled": False}))
-    assert response["applied"] == 1
+# ------------------------------------------- secret columns (2.0.0)
+
+
+SECRET = "s3cr3t-pw"
+
+
+def make_secret_tools(**cfg_kwargs):
+    fake = FakeIronflock(device_key=DEVICE_KEY,
+                         secret_columns={"assets": {"master_password"}})
+    return make_tools(fake=fake, **cfg_kwargs)
+
+
+async def test_secret_placeholder_shown_as_set_never_written_back():
+    fake, _, _, handlers = make_secret_tools()
+    seed_asset(fake, "Press 1", host="10.0.0.5", port=502,
+               master_password=SECRET, opcua_note=None)
+
+    response = check(await handlers["get"](asset_name="Press 1"))
+    assert response["asset"]["master_password"] == "(set)"
+    response = check(await handlers["list"]())
+    assert response["assets"][0]["master_password"] == "(set)"
+    assert "__secret__" not in json.dumps(response)
+
+    # the agent echoes the whole row from get, with one real change
+    echoed = dict(check(await handlers["get"](asset_name="Press 1"))["asset"])
+    echoed.pop("deleted")   # protected (pre-existing rule), not a secret
+    echoed["port"] = 1502
+    response = check(await handlers["update"](asset_name="Press 1",
+                                              changes=echoed))
+    assert response["ok"] is True, response
+    assert "master_password" in response["ignored"]
+    assert set(response["changed_fields"]) == {"port"}
+    assert response["applied"]["master_password"] == "(set)"
+    assert response["previous"]["master_password"] == "(set)"
+    for _, payload in fake.payloads:
+        assert "master_password" not in payload
+        assert "__secret__" not in payload.values()
+    assert fake.latest("assets", asset_name="Press 1")["master_password"] == SECRET
+
+    # the raw placeholder echoed alone is not a change either
+    response = check(await handlers["update"](
+        asset_name="Press 1", changes={"master_password": "__secret__"}))
+    assert response["status"] == "no_change"
+
+    # a validate function that drops the column does not clear the secret
+    def dropping(config, existing):
+        config = dict(config)
+        config.pop("master_password", None)
+        return config, []
+
+    _, _, _, dropping_handlers = make_tools(fake=fake, validate=dropping)
+    response = check(await dropping_handlers["update"](
+        asset_name="Press 1", changes={"port": 2502}))
+    assert set(response["changed_fields"]) == {"port"}
+    assert fake.latest("assets", asset_name="Press 1")["master_password"] == SECRET
+
+    # delete and re-create from 'previous' keeps the stored secret
+    response = check(await handlers["delete"](asset_name="Press 1"))
+    previous = dict(response["previous"])
+    assert previous["master_password"] == "(set)"
+    previous.pop("deleted")
+    response = check(await handlers["create"](asset_name="Press 1",
+                                              fields=previous))
+    assert response["ok"] is True, response
+    assert "master_password" in response["ignored"]
+    row = fake.latest("assets", asset_name="Press 1")
+    assert row["master_password"] == SECRET and row["deleted"] is False
+    for _, payload in fake.payloads:
+        assert "__secret__" not in payload.values()
+
+
+async def test_store_never_appends_the_secret_placeholder():
+    fake, store, _, _ = make_secret_tools()
+    seed_asset(fake, "Press 1", master_password=SECRET)
+    acked, err = await store.append_asset({
+        "asset_name": "Press 1", "gateway_id": DEVICE_KEY, "deleted": False,
+        "tsp": now_iso(), "master_password": "__secret__", "port": 1,
+    })
+    assert acked is True and err is None
     _, payload = fake.payloads[-1]
-    assert set(payload) == {"asset_name", "datapoint_id", "gateway_id",
-                            "deleted", "tsp", "enabled"}
-    row = fake.latest("datapoints", asset_name="Press 1",
-                      datapoint_id="temp")
-    assert row["enabled"] is False and row["address"] == "DB1.0"
+    assert "master_password" not in payload and payload["port"] == 1
+    assert fake.latest("assets", asset_name="Press 1")["master_password"] == SECRET
 
 
 # ------------------------------------------------------------------- misc
@@ -1387,6 +1648,9 @@ def test_guidance_constants_exported():
     assert "device_key" in RECOMMENDED_PROMPT_GUIDANCE
     assert "list_devices" in RECOMMENDED_PROMPT_GUIDANCE
     assert "error-logs" in SQL_DIAGNOSTICS_GUIDANCE
+    # switches live in datapoint_settings, the catalog in datapoints
+    assert "datapoint_settings" in SQL_DIAGNOSTICS_GUIDANCE
+    assert "catalog" in SQL_DIAGNOSTICS_GUIDANCE
     assert ASSET_NAME_PATTERN == r"^[a-zA-Z0-9 ]{3,50}$"
 
 

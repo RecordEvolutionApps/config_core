@@ -18,6 +18,9 @@ Models the platform semantics the library depends on, honestly:
   injected failures to the pre-1.6 style of returning None instead.
 - ``defer_visibility`` hides newly appended rows from getHistory until
   ``settle()`` -- exercises the store's verify retry honestly.
+- ``secret_columns`` ({table: {column, ...}}) models ``secret: true``
+  columns: rows store the real value, getHistory returns the placeholder
+  "__secret__" for every non-null one (ironflock.types.SECRET_PLACEHOLDER).
 """
 
 import asyncio
@@ -25,6 +28,7 @@ import asyncio
 IDENTITY_KEYS = {
     "assets": ("gateway_id", "asset_name"),
     "datapoints": ("gateway_id", "asset_name", "datapoint_id"),
+    "datapoint_settings": ("gateway_id", "asset_name", "datapoint_id"),
     "assetstatus": ("gateway_id", "asset_name"),
     "gateways": ("gateway_name",),
     # a generic (register_config_tools) table used by the test suite
@@ -46,8 +50,13 @@ def _identity(table, row):
 
 
 class FakeIronflock:
-    def __init__(self, device_key=471, none_mode=False, defer_visibility=False):
+    def __init__(self, device_key=471, none_mode=False, defer_visibility=False,
+                 secret_columns=None):
         self.device_key = device_key
+        self.secret_columns = {
+            table: set(columns)
+            for table, columns in (secret_columns or {}).items()
+        }
         self.none_mode = none_mode
         self.defer_visibility = defer_visibility
         self.tables = {}          # table -> list of rows (insertion order)
@@ -163,6 +172,13 @@ class FakeIronflock:
             for row in rows:  # insertion order == commit order
                 by_identity[_identity(table, row)] = row
             rows = list(by_identity.values())
+        secret = self.secret_columns.get(table, set())
+        if secret:
+            rows = [
+                {k: ("__secret__" if k in secret and v is not None else v)
+                 for k, v in row.items()}
+                for row in rows
+            ]
         return rows[: params.get("limit", 10)]
 
     async def register_device_function(self, topic, handler):

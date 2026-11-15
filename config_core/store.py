@@ -11,8 +11,14 @@ Reads use the 1.6.0 ``{"latest": True}`` filterAnd marker: the data backend
 derives the latest row per entity (the table's ``maintainLatestFlagFor`` key)
 in SQL. There is no physical ``latest_flag`` column anymore. Reads never
 filter on ``deleted`` -- the latest row of a deleted asset has
-``deleted=true``, and the handlers need to see it (re-create hints, cascade
-re-sweeps), so live/deleted partitioning happens in the handlers.
+``deleted=true``, and the handlers need to see it (re-create hints,
+'previous' undo), so live/deleted partitioning happens in the handlers.
+
+One writer per table (collector_core >= 3.0.0): this library writes the
+entity table (``assets``) and the per-datapoint user settings
+(``datapoint_settings``). The datapoint catalog (``datapoints``) belongs to
+the gateway -- it is read here, never written; the gateway itself
+soft-deletes a deleted asset's catalog rows.
 
 Writes rely on the fleetdb carry-over merge for entity tables: an appended
 payload is merged onto the previous latest row of its identity -- columns
@@ -35,8 +41,48 @@ PLATFORM_COLUMNS = ("tsp", "latest_flag", "authid", "device_key")
 # Runtime-only key collector_core caches on asset dicts; never persisted.
 RUNTIME_KEYS = ("datapoint_list",)
 
+# What getHistory returns for a non-null value of a ``secret: true`` column
+# (ironflock.types.SECRET_PLACEHOLDER; hard-coded -- this library imports
+# nothing). It is never written back: every append drops a column holding it,
+# so the platform's carry-over merge keeps the stored secret. Responses show
+# a set secret as SECRET_DISPLAY instead.
+SECRET_PLACEHOLDER = "__secret__"
+SECRET_DISPLAY = "(set)"
+
+
+def is_secret_placeholder(value):
+    return isinstance(value, str) and value == SECRET_PLACEHOLDER
+
+
+def drop_secret_placeholders(row):
+    """Row minus every column whose value is the secret placeholder."""
+    return {k: v for k, v in row.items() if not is_secret_placeholder(v)}
+
+
+def mask_secrets(value):
+    """Deep copy of a response with every secret placeholder replaced by
+    SECRET_DISPLAY -- the agent sees that a secret is set, never the
+    platform's internal marker (which it might echo back)."""
+    if is_secret_placeholder(value):
+        return SECRET_DISPLAY
+    if isinstance(value, dict):
+        return {k: mask_secrets(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [mask_secrets(v) for v in value]
+    return value
+
 ASSETS_LIMIT = 1000      # matches collector_core's own assets query window
 DATAPOINTS_LIMIT = 3000  # matches collector_core's datapoints query window
+SETTINGS_LIMIT = 3000    # one settings row per datapoint at most
+
+# The columns a datapoint_settings row may carry besides the optional audit
+# column: the identity, tsp and the user-owned settings. Mirrors
+# collector.USER_DATAPOINT_COLUMNS (kept literal here: the store imports
+# nothing from the handler layer). The table has no ``deleted`` column.
+SETTINGS_IDENTITY = ("gateway_id", "asset_name", "datapoint_id")
+SETTINGS_VALUE_COLUMNS = (
+    "enabled", "change_detection", "demo_value", "demo_variance",
+)
 
 
 def now_iso():
@@ -75,12 +121,21 @@ def normalized_equal(a, b):
 def normalized_diff(candidate, existing, ignore=("tsp",)):
     """{column: {"from": old, "to": new}} for every column whose normalized
     value differs between the two rows (union of keys, ``ignore`` skipped).
-    Empty dict == no effective change."""
+    Empty dict == no effective change.
+
+    Secret columns: a candidate still holding the placeholder, or no longer
+    holding a column whose stored value is the placeholder, is not a change
+    -- the placeholder is never written, so the stored secret stays. Only
+    an explicit value (null included) replaces a stored secret."""
     diff = {}
     for key in set(candidate) | set(existing):
         if key in ignore or key in PLATFORM_COLUMNS or key in RUNTIME_KEYS:
             continue
         old, new = existing.get(key), candidate.get(key)
+        if is_secret_placeholder(new):
+            continue
+        if is_secret_placeholder(old) and key not in candidate:
+            continue
         if not normalized_equal(old, new):
             diff[key] = {"from": old, "to": new}
     return diff
@@ -118,24 +173,28 @@ def _error_text(e):
 
 
 class AssetStore:
-    """Reads and writes one entity table (plus its optional datapoints and
+    """Reads and writes one entity table (plus its optional datapoint and
     status side tables) for ONE gateway (``gateway_id == device_key``).
     Never raises: every method returns explicit values plus an error string.
 
     Table topology lives here, once. The defaults are the collector family's
-    tables; ``register_config_tools`` injects the app's own ``table`` and
-    passes ``datapoints_table=None`` (no datapoint tools) and its
-    ``status_table``. A ``None`` side table disables the corresponding reads
-    and the handler features built on them."""
+    tables: ``datapoints_table`` is the gateway-written catalog (read only),
+    ``settings_table`` the user/agent-written per-datapoint settings.
+    ``register_config_tools`` injects the app's own ``table`` and passes
+    ``datapoints_table=None`` / ``settings_table=None`` (no datapoint tools)
+    and its ``status_table``. A ``None`` side table disables the
+    corresponding reads and the handler features built on them."""
 
     def __init__(self, ironflock, device_key, verify_retry_delay=1.0,
                  table="assets", datapoints_table="datapoints",
-                 status_table="assetstatus"):
+                 status_table="assetstatus",
+                 settings_table="datapoint_settings"):
         self.ironflock = ironflock
         self.device_key = int(device_key)
         self.verify_retry_delay = verify_retry_delay
         self.table = table
         self.datapoints_table = datapoints_table
+        self.settings_table = settings_table if datapoints_table else None
         self.status_table = status_table
 
     # ------------------------------------------------------------- notify
@@ -177,11 +236,20 @@ class AssetStore:
         return await self._read_latest(self.table, ASSETS_LIMIT)
 
     async def read_datapoints(self, asset_name):
-        """(rows, error) -- latest datapoint rows of one asset (live and
+        """(rows, error) -- latest catalog rows of one asset (live and
         deleted). Only called when ``datapoints_table`` is set."""
         return await self._read_latest(
             self.datapoints_table,
             DATAPOINTS_LIMIT,
+            [{"column": "asset_name", "operator": "=", "value": asset_name}],
+        )
+
+    async def read_settings(self, asset_name):
+        """(rows, error) -- latest datapoint_settings row per datapoint of
+        one asset. Only called when ``settings_table`` is set."""
+        return await self._read_latest(
+            self.settings_table,
+            SETTINGS_LIMIT,
             [{"column": "asset_name", "operator": "=", "value": asset_name}],
         )
 
@@ -201,20 +269,42 @@ class AssetStore:
             return problems
         return None
 
-    def check_datapoint_payload(self, payload):
-        """Poison-row invariants for a datapoints append. This is the
-        fleet-crash class: the collector's datapoints subscription handler
-        []-indexes datapoint_id/asset_name/deleted, so a row missing any of
-        them crashes the handler on every subscribed gateway."""
-        problems = self._check_common(payload)
-        if problems:
-            return problems
+    def check_setting_payload(self, payload, audit_column=None):
+        """Poison-row invariants for a datapoint_settings append. The
+        gateway follows this table live and keys every row on
+        (gateway_id, asset_name, datapoint_id): a row missing one of them
+        is useless at best and a crashed subscription handler at worst. The
+        table has a fixed shape -- identity, tsp, the four settings and the
+        audit column -- so anything else (``deleted`` included: the table
+        has no such column) is refused."""
+        problem = self._check_identity(payload)
+        if problem:
+            return problem
         datapoint_id = payload.get("datapoint_id")
         if not isinstance(datapoint_id, str) or not datapoint_id.strip():
-            return "datapoint payload must carry a non-empty datapoint_id"
+            return "settings payload must carry a non-empty datapoint_id"
+        allowed = set(SETTINGS_IDENTITY) | set(SETTINGS_VALUE_COLUMNS) | {"tsp"}
+        if audit_column:
+            allowed.add(audit_column)
+        extras = sorted(set(payload) - allowed)
+        if extras:
+            return (
+                f"settings payload must not carry {', '.join(extras)} "
+                "(not a datapoint_settings column)"
+            )
+        if not any(column in payload for column in SETTINGS_VALUE_COLUMNS):
+            return "settings payload must carry at least one setting"
         return None
 
     def _check_common(self, payload):
+        problem = self._check_identity(payload)
+        if problem:
+            return problem
+        if not isinstance(payload.get("deleted"), bool):
+            return "payload deleted flag must be a real boolean"
+        return None
+
+    def _check_identity(self, payload):
         name = payload.get("asset_name")
         if not isinstance(name, str) or not name.strip():
             return "payload must carry a non-empty asset_name"
@@ -223,8 +313,6 @@ class AssetStore:
                 f"payload gateway_id must be this gateway's device key "
                 f"({self.device_key}), got {payload.get('gateway_id')!r}"
             )
-        if not isinstance(payload.get("deleted"), bool):
-            return "payload deleted flag must be a real boolean"
         if not payload.get("tsp"):
             return "payload must carry a tsp"
         for column in PLATFORM_COLUMNS:
@@ -240,14 +328,19 @@ class AssetStore:
         choke point."""
         return await self._append(self.table, payload, self.check_asset_payload)
 
-    async def append_datapoint(self, payload):
-        """(acked, error) -- append one datapoints row after the strict
-        invariant choke point."""
+    async def append_setting(self, payload, audit_column=None):
+        """(acked, error) -- append one PARTIAL datapoint_settings row after
+        the strict invariant choke point. Columns the payload omits keep
+        their value (carry-over); an explicit null clears one."""
         return await self._append(
-            self.datapoints_table, payload, self.check_datapoint_payload
+            self.settings_table, payload,
+            lambda p: self.check_setting_payload(p, audit_column),
         )
 
     async def _append(self, table, payload, check):
+        # Never write the secret placeholder back: dropping the column lets
+        # the carry-over merge keep the stored secret.
+        payload = drop_secret_placeholders(payload)
         problem = check(payload)
         if problem:
             # Internal bug, not agent input: the pipeline should never build
@@ -296,38 +389,45 @@ class AssetStore:
                 await asyncio.sleep(self.verify_retry_delay)
         return "unverified", None, detail_text
 
-    # ------------------------------------------------------------ cascade
+    async def verify_settings(self, asset_name, written):
+        """Read back the asset's datapoint_settings rows and judge each of
+        our writes, ``written`` being ``{datapoint_id: tsp}``.
 
-    async def cascade_delete_datapoints(self, asset_name, audit=None):
-        """Soft-delete every live datapoints row of the asset with partial
-        tombstones (the platform's carry-over merge preserves the rest of
-        each row). Best-effort per row; returns ``(deleted_count,
-        failures)`` where failures is a list of "datapoint_id: error"
-        strings. Convergent: re-running sweeps whatever a partial run left
-        behind."""
-        rows, err = await self.read_datapoints(asset_name)
-        if err is not None:
-            return 0, [f"could not read datapoints: {err}"]
-        deleted, failures = 0, []
-        for row in rows:
-            if row.get("deleted"):
-                continue
-            payload = {
-                "asset_name": asset_name,
-                "datapoint_id": row.get("datapoint_id"),
-                "gateway_id": self.device_key,
-                "deleted": True,
-                "tsp": now_iso(),
-            }
-            if audit:
-                column, value = audit
-                payload[column] = value
-            acked, append_err = await self.append_datapoint(payload)
-            if acked:
-                deleted += 1
+        Returns ``{datapoint_id: (verdict, row, detail)}`` with the verdicts
+        of ``verify_asset``. One read covers the whole batch; when any write
+        is still undecided the read is retried once."""
+        results, detail_text = {}, None
+        for attempt in (0, 1):
+            rows, err = await self.read_settings(asset_name)
+            if err is not None:
+                detail_text = err
             else:
-                failures.append(f"{row.get('datapoint_id')}: {append_err}")
-        return deleted, failures
+                by_id = {str(r.get("datapoint_id")): r for r in rows}
+                for datapoint_id, written_tsp in written.items():
+                    if datapoint_id in results:
+                        continue
+                    row = by_id.get(datapoint_id)
+                    verdict, detail = _judge(row, written_tsp)
+                    if verdict == "verified":
+                        results[datapoint_id] = ("verified", row, None)
+                    elif verdict == "superseded":
+                        authid = (row or {}).get("authid")
+                        results[datapoint_id] = (
+                            "superseded", row,
+                            f"a newer write by {authid or 'another writer'} "
+                            "landed after ours",
+                        )
+                    else:
+                        detail_text = detail
+            if len(results) == len(written):
+                return results
+            if attempt == 0 and self.verify_retry_delay:
+                await asyncio.sleep(self.verify_retry_delay)
+        for datapoint_id in written:
+            results.setdefault(
+                datapoint_id, ("unverified", None, detail_text)
+            )
+        return results
 
 
 def _find_by_name(rows, asset_name):
