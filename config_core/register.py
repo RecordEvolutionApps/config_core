@@ -49,7 +49,8 @@ async def register_asset_tools(ironflock, validate, topics=DEFAULT_TOPICS,
                                name_pattern=ASSET_NAME_PATTERN,
                                audit_column=None, max_assets=200,
                                device_key=None,
-                               settings_table="datapoint_settings"):
+                               settings_table="datapoint_settings",
+                               clear_on_delete=()):
     """Register the collector asset CRUD endpoints. Returns the list of
     topics that FAILED to register (empty = success). Never raises: a
     config-tools outage must degrade the assistant, not the app.
@@ -87,6 +88,12 @@ async def register_asset_tools(ironflock, validate, topics=DEFAULT_TOPICS,
     "agent" on every write when the app's data-template declares the column.
     ``device_key`` defaults to the platform-injected DEVICE_KEY env var.
 
+    ``clear_on_delete`` names columns the delete row sets to null - an
+    app's ``secret: true`` columns. Without it a delete writes only the
+    tombstone and the platform's carry-over merge keeps every other column,
+    secrets included: a later board form re-creating the name with an empty
+    secret field (which leaves the column out) would inherit the old secret.
+
     Datapoints (collector_core >= 3.0.0, one writer per table): the
     ``datapoints`` catalog is the gateway's and is only READ;
     ``settings_table`` (default "datapoint_settings") holds the user-owned
@@ -112,7 +119,8 @@ async def register_asset_tools(ironflock, validate, topics=DEFAULT_TOPICS,
         store = AssetStore(ironflock, device_key_int,
                            settings_table=settings_table)
         cfg = ToolConfig(validate, name_pattern=name_pattern,
-                         audit_column=audit_column, max_assets=max_assets)
+                         audit_column=audit_column, max_assets=max_assets,
+                         clear_on_delete=clear_on_delete)
         return store, cfg
 
     return await _register(ironflock, validate, wanted, device_key,
@@ -124,7 +132,7 @@ async def register_config_tools(ironflock, validate, table, *,
                                 status_table=None, topics=None,
                                 name_pattern=ASSET_NAME_PATTERN,
                                 audit_column=None, max_entries=200,
-                                device_key=None):
+                                device_key=None, clear_on_delete=()):
     """Register generic config CRUD endpoints for one named-row table.
     Returns the list of topics that FAILED to register (empty = success).
     Never raises: a config-tools outage must degrade the assistant, not
@@ -158,8 +166,9 @@ async def register_config_tools(ironflock, validate, table, *,
 
     ``topics`` may be a partial dict over list/get/create/update/delete --
     missing operations use the defaults; an operation mapped to None is
-    skipped. ``audit_column`` and ``device_key`` behave as in
-    ``register_asset_tools``; ``max_entries`` caps creations per gateway.
+    skipped. ``audit_column``, ``device_key`` and ``clear_on_delete`` behave
+    as in ``register_asset_tools``; ``max_entries`` caps creations per
+    gateway.
     """
     defaults = {op: DEFAULT_TOPICS[op] for op in _CRUD_OPS}
     merged = dict(defaults)
@@ -180,7 +189,7 @@ async def register_config_tools(ironflock, validate, table, *,
                            status_table=status_table)
         cfg = ToolConfig(validate, name_pattern=name_pattern,
                          audit_column=audit_column, max_assets=max_entries,
-                         entity=entity)
+                         entity=entity, clear_on_delete=clear_on_delete)
         return store, cfg
 
     return await _register(ironflock, validate, wanted, device_key,

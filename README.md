@@ -48,7 +48,7 @@ the agent in the app's ai-template so it inspects `error-logs`,
 
 ```
 ironflock>=1.6.0
-ironflock-config-core @ git+https://github.com/RecordEvolutionApps/config_core.git@v2.0.0
+ironflock-config-core @ git+https://github.com/RecordEvolutionApps/config_core.git@v2.1.0
 ```
 
 In the app's `ProtocolAdapter.start_background(collector)` — the seam where
@@ -70,7 +70,7 @@ else:
 
 `register_asset_tools(ironflock, validate, topics=DEFAULT_TOPICS,
 name_pattern=..., audit_column=None, max_assets=200, device_key=None,
-settings_table="datapoint_settings")` returns the list of topics that
+settings_table="datapoint_settings", clear_on_delete=())` returns the list of topics that
 FAILED to register (empty = success) and never raises. Optional knobs:
 `topics` may be a partial dict (an operation mapped to `None` is skipped,
 e.g. no delete tool), `audit_column` (e.g. `"configured_by"`) is stamped
@@ -112,7 +112,8 @@ await register_config_tools(
     noun="connection",                 # prose in hints and toasts
     create_defaults={"enabled": True}, # seeded UNDER agent fields on create
     status_table="assetstatus",        # or None: no live_status join
-    # topics=, name_pattern=, audit_column=, max_entries=200, device_key=
+    # topics=, name_pattern=, audit_column=, max_entries=200, device_key=,
+    # clear_on_delete=("auth_password",)  # secret columns a delete nulls
 )
 ```
 
@@ -337,7 +338,11 @@ steering text for the agent and are NOT part of the semver contract.
   becomes reusable) and writes only the `assets` tombstone; the gateway
   soft-deletes the asset's catalog rows when it sees it. Deleting an
   already-deleted asset is `no_change`. Settings rows are left alone (the
-  table has no `deleted` column).
+  table has no `deleted` column). `clear_on_delete=(...)` names columns the
+  tombstone sets to null — pass the app's `secret: true` columns: carry-over
+  otherwise keeps a deleted row's secrets, and a board form re-creating the
+  name with an empty secret field (which leaves the column out) would
+  inherit them. A board's own delete dialog has to clear them too.
 - **Secret columns.** Apps may declare `secret: true` columns on `assets`;
   reads return the placeholder `"__secret__"` for a set secret. The tools
   never write the placeholder back: every append drops a column holding it

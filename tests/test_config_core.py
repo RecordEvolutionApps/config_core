@@ -1737,3 +1737,43 @@ def test_sql_guidance_picks_the_newest_row_before_the_deleted_filter():
     assert "deleted IS NOT TRUE" in guidance
     assert "DISTINCT ON" in guidance
     assert "deleted = false" not in guidance
+
+
+# ------------------------------------------------ clear_on_delete (2.1.0)
+
+
+async def test_delete_nulls_the_clear_on_delete_columns():
+    fake, _, _, handlers = make_tools(
+        audit_column="configured_by",
+        clear_on_delete=("auth_password", "tls_client_key", "deleted", "tsp"))
+    seed_asset(fake, "Press 1", host="10.0.0.5", auth_password="__secret__",
+               tls_client_key="__secret__")
+    response = check(await handlers["delete"](asset_name="Press 1"))
+    assert response["status"] == "deleted"
+    _, payload = fake.payloads[-1]
+    assert payload["auth_password"] is None and payload["tls_client_key"] is None
+    # the protected columns named by mistake keep the tombstone's values
+    assert payload["deleted"] is True and payload["tsp"]
+    assert set(payload) == {"asset_name", "gateway_id", "deleted", "tsp",
+                            "configured_by", "auth_password", "tls_client_key"}
+    row = fake.latest("assets", asset_name="Press 1")
+    assert row["auth_password"] is None      # the secret ended with the row
+    assert row["host"] == "10.0.0.5"         # everything else carries over
+
+
+async def test_delete_without_clear_on_delete_writes_only_the_tombstone():
+    fake, _, _, handlers = make_tools()
+    seed_asset(fake, "Press 1", auth_password="__secret__")
+    check(await handlers["delete"](asset_name="Press 1"))
+    _, payload = fake.payloads[-1]
+    assert set(payload) == {"asset_name", "gateway_id", "deleted", "tsp"}
+
+
+async def test_generic_tools_take_clear_on_delete_too():
+    fake, _, _, handlers = make_generic_tools(clear_on_delete=("api_secret",))
+    fake.external_append("connections", {
+        "tsp": now_iso(), "asset_name": "Line 1", "gateway_id": DEVICE_KEY,
+        "deleted": False, "api_secret": "__secret__"})
+    check(await handlers["delete"](asset_name="Line 1"))
+    _, payload = fake.payloads[-1]
+    assert payload["api_secret"] is None

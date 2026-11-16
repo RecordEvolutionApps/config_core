@@ -161,11 +161,19 @@ class ToolConfig:
     register_asset_tools / register_config_tools, never by the app)."""
 
     def __init__(self, validate, name_pattern=ASSET_NAME_PATTERN,
-                 audit_column=None, max_assets=200, entity=None):
+                 audit_column=None, max_assets=200, entity=None,
+                 clear_on_delete=()):
         self.validate = validate
         self.name_pattern = re.compile(name_pattern)
         self.audit_column = audit_column
         self.max_assets = max_assets
+        # Columns a delete row sets to null (see register_*_tools). Never a
+        # protected column: the tombstone's own columns win.
+        self.clear_on_delete = tuple(
+            column for column in (clear_on_delete or ())
+            if column not in ("asset_name", "gateway_id", "deleted", "tsp")
+            and column not in PLATFORM_COLUMNS and column != audit_column
+        )
         # None = the collector preset entity: keeps ToolConfig(validate)
         # meaning exactly what it did before entities existed. Imported
         # lazily -- collector.py imports this module at its top.
@@ -1109,12 +1117,17 @@ async def delete_asset(store, cfg, asset_name, expected_tsp=None,
 
     # Partial tombstone: carry-over keeps the dead row's configuration
     # visible (re-create hints, 'previous'-style undo) without echoing it.
-    tombstone = {
+    # The clear_on_delete columns are the exception: an explicit null ends
+    # them with the row (a secret must not outlive its connection and be
+    # inherited by whoever re-creates the name on a board form, where an
+    # empty secret field keeps the stored value).
+    tombstone = {column: None for column in cfg.clear_on_delete}
+    tombstone.update({
         "asset_name": name,
         "gateway_id": store.device_key,
         "deleted": True,
         "tsp": now_iso(),
-    }
+    })
     audit = cfg.audit()
     if audit:
         column, value = audit

@@ -9,7 +9,7 @@ datapoints catalog, datapoint_settings, assetstatus);
 See README.md for the full contract.
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 from .collector import (
     RECOMMENDED_PROMPT_GUIDANCE,
