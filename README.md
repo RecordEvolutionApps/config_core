@@ -374,10 +374,23 @@ steering text for the agent and are NOT part of the semver contract.
 
 ## ai-template blocks (copy-paste per app)
 
-Paste into your configuring agent's `tools`, edit only the two spots marked
-`app-specific`, set `data_access: true` on the agent, append the two
+Paste into your configuring agent's `tools`, edit the two spots marked
+`app-specific`, review the tool markings for your app, set `data_access: true`
+on the agent, append the two
 guidance texts to its system prompt and give it a few extra
 `max_iterations` for the list → dry_run → apply → verify loop.
+
+Every topic tool has a human-readable `title` and MCP `annotations`. These
+are developer assertions about the handler, not a safety guarantee. The examples
+mark reads as read-only and closed-world because they read stored configuration
+and status. Creating an asset is additive; updating or deleting assets and
+changing datapoint settings can overwrite existing state. The writes are marked
+idempotent. Asset creation and updates are marked open-world; deletion and
+datapoint settings operate on stored configuration. Recheck these claims when
+adapting the handlers or their validation hooks to another app.
+A `dry_run` argument does not change a tool's marking: the same handler can
+apply a write. Keep aliases of the same topic consistently marked across agents.
+Do not put annotations on delegation tools.
 
 Every block declares `device_key`. The platform adds that parameter to any
 tool with a `topic` and strips it before your handler runs — it addresses
@@ -395,6 +408,10 @@ blocks set. Keep it in `required`.
         see what exists before creating, updating, deleting or
         troubleshooting anything.
       topic: app_assets.list
+      title: List assets
+      annotations:
+        readOnlyHint: true
+        openWorldHint: false
       parameters:
         type: object
         properties:
@@ -419,6 +436,10 @@ blocks set. Keep it in `required`.
         returned _meta.tsp as expected_tsp on later updates to guard
         against concurrent edits.
       topic: app_assets.get
+      title: Read asset settings
+      annotations:
+        readOnlyHint: true
+        openWorldHint: false
       parameters:
         type: object
         properties:
@@ -442,6 +463,12 @@ blocks set. Keep it in `required`.
         true first, show the user exactly what will be created and apply
         only after they confirm.
       topic: app_assets.create
+      title: Create asset
+      annotations:
+        readOnlyHint: false
+        destructiveHint: false
+        idempotentHint: true
+        openWorldHint: true
       parameters:
         type: object
         properties:
@@ -476,6 +503,12 @@ blocks set. Keep it in `required`.
         dry_run true to preview, confirm with the user, then apply and
         verify with get_asset.
       topic: app_assets.update
+      title: Update asset settings
+      annotations:
+        readOnlyHint: false
+        destructiveHint: true
+        idempotentHint: true
+        openWorldHint: true
       parameters:
         type: object
         properties:
@@ -510,6 +543,12 @@ blocks set. Keep it in `required`.
         response includes the previous config so an accidental delete can
         be undone via create_asset.
       topic: app_assets.delete
+      title: Delete asset
+      annotations:
+        readOnlyHint: false
+        destructiveHint: true
+        idempotentHint: true
+        openWorldHint: false
       parameters:
         type: object
         properties:
@@ -537,6 +576,10 @@ blocks set. Keep it in `required`.
         configuration (or device discovery) - to add or remove datapoints,
         update the asset instead.
       topic: app_datapoints.list
+      title: List datapoints
+      annotations:
+        readOnlyHint: true
+        openWorldHint: false
       parameters:
         type: object
         properties:
@@ -564,6 +607,12 @@ blocks set. Keep it in `required`.
         scale) is defined by the asset's configuration - change that
         instead.
       topic: app_datapoints.set
+      title: Set datapoint settings
+      annotations:
+        readOnlyHint: false
+        destructiveHint: true
+        idempotentHint: true
+        openWorldHint: false
       parameters:
         type: object
         properties:
